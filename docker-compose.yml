@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  multitor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "16379:16379" # Maps host port 16379 to container port 16379 (HAProxy)
+    volumes:
+      - ./custom_templates:/usr/src/app/templates # Maps custom templates from host to container
+    environment:
+      - TOR_INSTANCES=5 # Default number of Tor instances, can be overridden in .env file or by CLI
+    cap_add:
+      - NET_ADMIN # Required by Tor for some operations, and potentially by HAProxy/Privoxy.
+    # restart: unless-stopped # Optional: configure restart policy
