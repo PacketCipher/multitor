@@ -1,0 +1,33 @@
+# Git specific files
+.git/
+.gitignore
+.gitattributes
+
+# GitHub specific files
+.github/
+
+# Docker specific files (do not ignore Dockerfile itself if it's in the context root)
+# docker-compose.yml # Usually not ignored as it might be used in CI/CD or by users
+# .dockerignore # This file itself
+
+# Documentation files (unless specifically needed in the image)
+README.md
+LICENSE.md
+*.md
+
+# Local development files
+.idea/
+*.swp
+*.swo
+*~
+
+# Custom templates directory - this should be mounted as a volume, not copied
+custom_templates/
+
+# Logs and temporary files (if any are generated locally)
+log/
+tmp/
+
+# OS-specific files
+.DS_Store
+Thumbs.db

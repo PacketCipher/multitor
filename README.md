@@ -132,7 +132,98 @@ Also you will need **root access**.
 
 ## Docker
 
-See this project: **[docker-multitor](https://github.com/evait-security/docker-multitor)**
+This project includes a `Dockerfile` and `docker-compose.yml` for easy setup and deployment.
+
+### Prerequisites
+
+- Docker: [Install Docker](https://docs.docker.com/get-docker/)
+- Docker Compose: [Install Docker Compose](https://docs.docker.com/compose/install/) (usually included with Docker Desktop)
+
+### Building the Docker Image
+
+You can build the Docker image directly using the `docker build` command:
+
+```bash
+docker build -t multitor .
+```
+
+### Running with Docker Compose (Recommended)
+
+The easiest way to run `multitor` with Docker is by using Docker Compose. This method utilizes the `docker-compose.yml` file which is pre-configured for common use cases.
+
+1.  **Start `multitor`**:
+    ```bash
+    docker-compose up
+    ```
+    By default, this will start `multitor` with 5 Tor instances and expose HAProxy on port `16379` of your host machine.
+
+2.  **Customize Tor Instances**:
+    You can change the number of Tor instances by setting the `TOR_INSTANCES` environment variable. You can do this by:
+    *   Creating a `.env` file in the same directory as `docker-compose.yml` with the line:
+        ```
+        TOR_INSTANCES=10
+        ```
+    *   Or by prefixing the command:
+        ```bash
+        TOR_INSTANCES=10 docker-compose up
+        ```
+
+3.  **Using Custom Templates**:
+    If you need to use custom configuration templates for Tor, HAProxy, Privoxy, or Polipo:
+    *   Create a directory named `custom_templates` in the root of the project (same directory as `docker-compose.yml`).
+    *   Place your custom template files in this directory (e.g., `custom_templates/torrc-template.cfg`).
+    *   Docker Compose is configured to mount this directory into the container at `/usr/src/app/templates`. `multitor` will then use any templates it finds there, falling back to its default templates if a custom one isn't provided.
+
+    The default template files that can be overridden are:
+    *   `haproxy-template.cfg`
+    *   `polipo-template.cfg`
+    *   `privoxy-template.cfg`
+    *   `torrc-template.cfg`
+
+4.  **Accessing the Proxy**:
+    Once running, the HAProxy load balancer will be accessible at `http://localhost:16379` (or whatever host your Docker daemon is running on).
+
+5.  **Stopping `multitor`**:
+    ```bash
+    docker-compose down
+    ```
+
+### Running with Docker (Manual)
+
+If you prefer not to use Docker Compose, you can run the container directly using `docker run`.
+
+1.  **Build the image first (if you haven't already)**:
+    ```bash
+    docker build -t multitor .
+    ```
+
+2.  **Run the container**:
+    ```bash
+    docker run -d -p 16379:16379 --name multitor_container -e TOR_INSTANCES=5 multitor
+    ```
+    *   `-d`: Run in detached mode.
+    *   `-p 16379:16379`: Map port 16379.
+    *   `--name multitor_container`: Assign a name to the container.
+    *   `-e TOR_INSTANCES=5`: Set the number of Tor instances.
+    *   To use custom templates, you would need to add a volume mount:
+        ```bash
+        docker run -d -p 16379:16379 --name multitor_container \
+          -e TOR_INSTANCES=5 \
+          -v "$(pwd)/custom_templates:/usr/src/app/templates" \
+          multitor
+        ```
+        Ensure the `custom_templates` directory exists locally.
+
+3.  **Viewing Logs**:
+    ```bash
+    docker logs -f multitor_container
+    ```
+
+4.  **Stopping and Removing the Container**:
+    ```bash
+    docker stop multitor_container
+    docker rm multitor_container
+    ```
 
 ## Other
 
