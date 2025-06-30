@@ -34,23 +34,41 @@ function CreateTorProcess() {
   # We create a directory for the new tor process.
   CreateTorDirectory
 
-  # We save the hash of the password to the configuration file.
   # shellcheck disable=SC2154
-  echo "HashedControlPassword ${_pass_hash}" > "${_torrc_config}"
+  local _torrc_template="${_tml}/torrc-template.cfg"
+
+  # Copy the template to the process-specific torrc file
+  if cp "${_torrc_template}" "${_torrc_config}"; then
+    _logger "info" \
+      "${_FUNCTION_ID}()" \
+      "copied torrc template to ${_torrc_config}"
+  else
+    _logger "stop" \
+      "${_FUNCTION_ID}()" \
+      "failed to copy torrc template to ${_torrc_config}"
+    return 1 # Or handle error appropriately
+  fi
+
+  # Append dynamic configurations
+  {
+    echo "" # Add a newline for separation
+    echo "HashedControlPassword ${_pass_hash}"
+    echo "SocksPort ${_arg_socks}"
+    echo "ControlPort ${_arg_control}"
+    echo "PidFile ${_proc_dir}/${_arg_socks}.pid"
+    echo "DataDirectory ${_proc_dir}"
+  } >> "${_torrc_config}"
   _kstate="$?"
 
   if [[ $_kstate -eq 0 ]] ; then
-
     _logger "info" \
       "${_FUNCTION_ID}()" \
-      "saved HashedControlPassword correctly"
-
+      "appended dynamic configurations to ${_torrc_config}"
   else
-
     _logger "stop" \
       "${_FUNCTION_ID}()" \
-      "not saved HashedControlPassword correctly"
-
+      "failed to append dynamic configurations to ${_torrc_config}"
+    return 1 # Or handle error appropriately
   fi
 
   # shellcheck disable=SC2154
@@ -72,25 +90,10 @@ function CreateTorProcess() {
 
   fi
 
+  # Start Tor with the generated torrc file
+  # Options previously passed as command line arguments are now in the torrc file
   # shellcheck disable=SC2024
-  sudo -u "$_arg_uname" tor -f "${_torrc_config}" \
-       --RunAsDaemon 1 \
-       --CookieAuthentication 0 \
-       --SocksPort "$_arg_socks" \
-       --ControlPort "$_arg_control" \
-       --PidFile "${_proc_dir}/${_arg_socks}.pid" \
-       --DataDirectory "${_proc_dir}" \
-       --SocksBindAddress 127.0.0.1 \
-       --NewCircuitPeriod 15 \
-       --MaxCircuitDirtiness 15 \
-       --NumEntryGuards 8 \
-       --CircuitBuildTimeout 5 \
-       --ExitRelay 0 \
-       --RefuseUnknownExits 0 \
-       --ClientOnly 1 \
-       --StrictNodes 1 \
-       --AllowSingleHopCircuits 1 \
-       >>"$_log_stdout" 2>&1 ; _kstate="$?"
+  sudo -u "$_arg_uname" tor -f "${_torrc_config}" >>"$_log_stdout" 2>&1 ; _kstate="$?"
 
   if [[ $_kstate -eq 0 ]] ; then
 
