@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+
+# shellcheck shell=bash
+
+# ``````````````````````````````````````````````````````````````````````````````
+# Function name: CreateCustomLbProcess()
+#
+# Description:
+#   It creates and starts the custom Python load balancer.
+#
+# Usage:
+#   CreateCustomLbProcess
+#
+# Examples:
+#   CreateCustomLbProcess
+#
+
+function CreateCustomLbProcess() {
+
+  # shellcheck disable=SC2034
+  local _FUNCTION_ID="CreateCustomLbProcess"
+  local _STATE=0
+
+  # Define listening parameters for the custom load balancer
+  local _lb_listen_host="127.0.0.1"
+  # Using a different port than HAProxy's default 16379
+  local _lb_listen_port="16378"
+
+  # Construct the comma-separated list of Tor SOCKS proxies
+  # _proxy_ports is expected to be a global array populated in src/__init__
+  # shellcheck disable=SC2154
+  if [[ ${#_proxy_ports[@]} -eq 0 ]]; then
+    _logger "error" \
+      "${_FUNCTION_ID}()" \
+      "No Tor SOCKS proxy ports available in _proxy_ports array. Cannot start custom_lb."
+    return 1
+  fi
+
+  local _tor_proxies_list=""
+  local _first_port=true
+  # shellcheck disable=SC2154
+  for _port in "${_proxy_ports[@]}" ; do
+    if [[ "$_first_port" == true ]]; then
+      _tor_proxies_list="127.0.0.1:${_port}"
+      _first_port=false
+    else
+      _tor_proxies_list="${_tor_proxies_list},127.0.0.1:${_port}"
+    fi
+  done
+
+  _logger "info" \
+    "${_FUNCTION_ID}()" \
+    "Starting custom_lb.py to listen on ${_lb_listen_host}:${_lb_listen_port}"
+  _logger "info" \
+    "${_FUNCTION_ID}()" \
+    "Target Tor SOCKS proxies for custom_lb.py: ${_tor_proxies_list}"
+
+  # Path to the Python script
+  # shellcheck disable=SC2154
+  local _python_script_path="${_lib}/custom_lb.py"
+
+  # Check if Python script exists and is executable
+  if [[ ! -f "$_python_script_path" ]]; then
+    _logger "error" \
+      "${_FUNCTION_ID}()" \
+      "Custom LB Python script not found at ${_python_script_path}"
+    return 1
+  fi
+  # Making sure it's executable (though python3 path is usually enough)
+  # chmod +x "$_python_script_path" # This should ideally be done at setup/install time
+
+  # Launch the Python script in the background
+  # Redirect stdout and stderr to multitor's log files
+  # shellcheck disable=SC2154
+  nohup python3 "$_python_script_path" \
+    --listen-host "$_lb_listen_host" \
+    --listen-port "$_lb_listen_port" \
+    --tor-proxies "$_tor_proxies_list" >> "$_log_stdout" 2>&1 &
+
+  local _py_pid=$!
+
+  # Optional: Store PID if we want to manage it more directly later
+  # For now, pgrep in src/__init__ handles finding it for kill.
+  # If a PID file is needed, it could be created here:
+  # echo "$_py_pid" > "${_multitor_directory}/custom_lb.pid"
+
+  # Check if the process started (basic check, more robust checks could be added)
+  # Give it a moment to potentially fail or start
+  sleep 0.5
+  if ps -p "$_py_pid" > /dev/null ; then
+    _logger "info" \
+      "${_FUNCTION_ID}()" \
+      "custom_lb.py started successfully with PID ${_py_pid}."
+    # Potentially add _py_pid to _proxy_processes_list if CheckProxyProcess is adapted for it
+    # Or manage a separate list/pidfile for custom_lb
+  else
+    _logger "error" \
+      "${_FUNCTION_ID}()" \
+      "custom_lb.py failed to start or exited quickly. Check logs at ${_log_stdout}."
+    _STATE=1
+  fi
+
+  # The printout in src/__init__ for "Proxy state" will indicate running/failed.
+  # If _STATE is 1 here, it implies failure. The main script might not directly use this return
+  # but relies on process checks.
+  # For the status message in __init__, it currently assumes success if this script is called.
+  # A more robust way would be for this script to update a global var or for __init__ to check PID.
+
+  return $_STATE
+}
+# [end of lib/CreateCustomLbProcess] - This is a comment for the agent, not part of the script code.

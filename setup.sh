@@ -33,6 +33,29 @@ if [[ "$1" == "install" ]] ; then
 
   fi
 
+  # Install Python dependencies for custom_lb
+  printf "\\n%s\\n" "Checking and installing Python dependencies (requests, pysocks)..."
+  if command -v apt-get &> /dev/null; then
+    if dpkg -s python3-requests &> /dev/null && dpkg -s python3-pysocks &> /dev/null && dpkg -s tor &> /dev/null; then
+      printf "%s\\n" "Python and Tor dependencies already satisfied."
+    else
+      printf "%s\\n" "Attempting to install tor, python3-requests, and python3-pysocks..."
+      # Run update once
+      apt-get update -qq
+      if apt-get install -y tor python3-requests python3-pysocks; then
+        printf "%s\\n" "Successfully installed tor, python3-requests, and python3-pysocks."
+      else
+        printf "%s\\n" "WARNING: Failed to install some dependencies (tor, python3-requests, python3-pysocks). Required features may not work."
+        printf "%s\\n" "Please try installing them manually (e.g., sudo apt-get install tor python3-requests python3-pysocks)."
+      fi
+    fi
+  else
+    printf "%s\\n" "WARNING: 'apt-get' not found. Cannot automatically install Python dependencies."
+    printf "%s\\n" "Please ensure 'python3-requests' and 'python3-pysocks' are installed for custom_lb functionality."
+  fi
+  printf "%s\\n" "--------------------------------------------------------------------"
+
+
 elif [[ "$1" == "uninstall" ]] ; then
 
   printf "%s\\n" "Remove symbolic link from /usr/local/bin"
