@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+
+# shellcheck shell=bash
+
+# ``````````````````````````````````````````````````````````````````````````````
+# Function name: restart_tor_instance()
+#
+# Description:
+#   Restarts a specific Tor instance.
+#
+# Usage:
+#   restart_tor_instance "username" "socks_port" "control_port"
+#
+# Examples:
+#   restart_tor_instance "debian-tor" "9050" "9051"
+#
+
+function restart_tor_instance() {
+
+  local _FUNCTION_ID="restart_tor_instance"
+  # shellcheck disable=SC2034
+  local _STATE=0 # Assume success initially
+
+  local _arg_uname="$1"
+  local _arg_socks="$2"
+  local _arg_control="$3"
+
+  # shellcheck disable=SC2154 # _multitor_directory is expected to be global
+  local _proc_dir="${_multitor_directory}/${_arg_socks}"
+  local _pid_file="${_proc_dir}/${_arg_socks}.pid"
+  local _torrc_file="${_proc_dir}/${_arg_socks}.torrc" # Added for completeness, though CreateTorProcess handles it
+
+  _logger "info" \
+    "${_FUNCTION_ID}()" \
+    "Attempting to restart Tor instance with SOCKS port ${_arg_socks}"
+
+  if [[ -f "$_pid_file" ]]; then
+    local _pid
+    _pid=$(cat "${_pid_file}")
+    if [[ -n "$_pid" ]]; then
+      _logger "info" \
+        "${_FUNCTION_ID}()" \
+        "Stopping Tor instance with PID ${_pid} (SOCKS: ${_arg_socks})"
+      DestroyProcess "$_pid" # DestroyProcess is expected to be available
+      # Brief pause to allow the process to terminate and release resources
+      sleep 2
+      # It's good practice to remove the old PID file
+      if rm -f "${_pid_file}"; then
+        _logger "info" \
+          "${_FUNCTION_ID}()" \
+          "Removed old PID file: ${_pid_file}"
+      else
+        _logger "warn" \
+          "${_FUNCTION_ID}()" \
+          "Could not remove old PID file: ${_pid_file}"
+      fi
+    else
+      _logger "warn" \
+        "${_FUNCTION_ID}()" \
+        "PID file ${_pid_file} is empty. Attempting to start new instance anyway."
+    fi
+  else
+    _logger "warn" \
+      "${_FUNCTION_ID}()" \
+      "PID file ${_pid_file} not found. Attempting to start new instance."
+  fi
+
+  _logger "info" \
+    "${_FUNCTION_ID}()" \
+    "Starting new Tor instance for SOCKS port ${_arg_socks}"
+
+  # CreateTorProcess will regenerate the torrc and start Tor
+  # It needs _pass_hash, _multitor_directory, _tml, _logger, _log_stdout to be set globally
+  # It also increments _tor_processes_done or _tor_processes_fail
+  CreateTorProcess "${_arg_uname}" "${_arg_socks}" "${_arg_control}"
+  local _creation_status="$?"
+
+  if [[ "$_creation_status" -eq 0 ]]; then
+    _logger "info" \
+      "${_FUNCTION_ID}()" \
+      "Successfully restarted Tor instance for SOCKS port ${_arg_socks}"
+    return 0
+  else
+    _logger "error" \
+      "${_FUNCTION_ID}()" \
+      "Failed to restart Tor instance for SOCKS port ${_arg_socks}"
+    return 1
+  fi
+}
