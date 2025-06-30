@@ -55,44 +55,13 @@ function __main__() {
 
   # We place here used commands at script runtime, as strings to anything
   # unnecessarily run.
-  readonly commands=(basename dirname stat ps date grep cut sed awk chown \
-                     chmod mkdir pidof tor sudo nc kill \
-                     haproxy privoxy)
+  # Moved the command check to after getopt parsing, so we know proxy_type.
+  # Default essential commands:
+  local essential_commands=(basename dirname stat ps date grep cut sed awk chown \
+                           chmod mkdir pidof tor sudo nc kill)
 
   # If you intend to specify the full path to the command we do it like:
   # readonly exec_gzip="/bin/gzip"
-
-  # Stores the names of the missing commands.
-  missing_hash=()
-  missing_counter="0"
-
-  for i in "${commands[@]}" ; do
-
-    if [[ ! -z "$i" ]] ; then
-
-      hash "$i" >/dev/null 2>&1 ; state="$?"
-
-      # If the command was not found put it in the array
-      if [[ "$state" -ne 0 ]] ; then
-
-        missing_hash+=("$i")
-        ((missing_counter++))
-
-      fi
-
-    fi
-
-  done
-
-  # It is a good idea to terminate the script at this stage
-  # with information for the user to fix the errors if at least one
-  # of the required commands in the commands array is not found.
-  if [[ "$missing_counter" -gt 0 ]] ; then
-
-    printf "not found in PATH: %s\\n" "${missing_hash[*]}" >&2
-    _exit_ "1"
-
-  fi
 
   if [[ "$time_tracking" == "true" ]] ; then
     _begtime=$(date +%s) ; fi
@@ -218,7 +187,14 @@ function __main__() {
 
         export proxy_type="${2}"
 
+        # Ensure proxy_type is converted to lowercase for consistent checking
+        proxy_type=$(echo "$proxy_type" | tr '[:upper:]' '[:lower:]')
+
         shift 2 ;;
+
+      # No --custom-lb specific flag, it's a value for --proxy
+      # --custom-lb was added to _long_opt to ensure getopt recognizes it if someone tries to use it as a flag by mistake,
+      # but it won't have a case here. The value "custom_lb" for --proxy will be handled by proxy_type logic.
 
       --haproxy)
 
@@ -252,6 +228,50 @@ function __main__() {
       "${_FUNCTION_ID}()" \
       "starting debug mode"
 
+  fi
+
+  # Dynamically build the list of commands to check based on proxy_type
+  local commands_to_check=("${essential_commands[@]}")
+  if [[ "$proxy_state" -eq 1 ]] ; then
+    if [[ "$proxy_type" == "socks" || "$frontend_type" == "haproxy" || "$proxy_type" == "polipo" || "$proxy_type" == "privoxy" ]] ; then
+      commands_to_check+=("haproxy")
+    fi
+    if [[ "$proxy_type" == "polipo" ]] ; then
+      # Polipo isn't in the original commands array, but if it were a distinct binary:
+      # commands_to_check+=("polipo")
+      true # Assuming polipo might be covered by other checks or not a direct binary check
+    fi
+    if [[ "$proxy_type" == "privoxy" ]] ; then
+      commands_to_check+=("privoxy")
+    fi
+    # "custom_lb" does not add new binary dependencies to check here beyond python3 (handled by script execution) and tor.
+  elif [[ -z "$proxy_state" || "$proxy_state" -eq 0 ]] ; then
+    # No proxy, or proxy not haproxy/privoxy. Check for haproxy and privoxy anyway,
+    # as the original script did, unless we want to be very minimal.
+    # For safety and closer original behavior when no proxy or specific non-HAProxy proxy is chosen:
+    commands_to_check+=("haproxy" "privoxy")
+  fi
+
+  # Stores the names of the missing commands.
+  local missing_hash=()
+  local missing_counter="0"
+
+  for i in "${commands_to_check[@]}" ; do
+    if [[ ! -z "$i" ]] ; then
+      hash "$i" >/dev/null 2>&1 ; state="$?"
+      if [[ "$state" -ne 0 ]] ; then
+        missing_hash+=("$i")
+        ((missing_counter++))
+      fi
+    fi
+  done
+
+  if [[ "$missing_counter" -gt 0 ]] ; then
+    printf "Error: Required command(s) not found in PATH: %s\\n" "${missing_hash[*]}" >&2
+    _logger "stop" \
+      "${_FUNCTION_ID}()" \
+      "Required command(s) not found in PATH: ${missing_hash[*]}"
+    # _exit_ "1" # _logger stop will exit
   fi
 
   # Running tasks before start user functions.
@@ -403,7 +423,9 @@ function __main__() {
   # Checking if proxy is set.
   if [[ "$proxy_state" -eq 1 ]] ; then
 
+    # Add "custom_lb" to the list of allowed proxy types
     if [[ "$proxy_type" == "socks" ]] || \
+       [[ "$proxy_type" == "custom_lb" ]] || \
        [[ " ${_proxy_list[*]} " =~ $proxy_type ]] ; then
 
       _logger "info" \
@@ -651,32 +673,48 @@ function __main__() {
     _proxy_processes_list=()
 
     # shellcheck disable=SC2034
-    # Manages proxy processes stack.
+    # Manages proxy processes stack for haproxy, polipo, privoxy.
     for _proc in "haproxy" "${_proxy_list[@]}" ; do
 
-      CheckProxyProcess "${_proc}"
+      CheckProxyProcess "${_proc}" # This populates _proxy_processes_list
 
     done
 
     # shellcheck disable=SC2154
-    for _hproc in "${_proxy_processes_list[@]}" ; do
+    for _hproc in "${_proxy_processes_list[@]}" ; do # This kills haproxy, polipo, privoxy based on PIDs found
 
       DestroyProcess "${_hproc}"
 
     done
 
+    local _custom_lb_active=false
     if [[ "$proxy_state" -eq 1 ]] ; then
 
-      CreateProxyProcess
-
+      if [[ "$proxy_type" == "custom_lb" ]] ; then
+        # Source and call CreateCustomLbProcess
+        # shellcheck disable=SC1090,SC1091
+        source "${_lib}/CreateCustomLbProcess"
+        CreateCustomLbProcess
+        if [[ $? -eq 0 ]]; then
+          _custom_lb_active=true
+          # CreateCustomLbProcess logs success/failure and PID.
+          # For _proxy_processes_list, if custom_lb.py PID needs to be there for other functions,
+          # CreateCustomLbProcess should add it or return it.
+          # For now, _custom_lb_active flag is enough for status message.
+        else
+          _custom_lb_active=false
+        fi
+      else
+        # Original HAProxy/Polipo/Privoxy logic
+        CreateProxyProcess
+        # CheckProxyProcess for haproxy, polipo, privoxy will populate _proxy_processes_list
+        # This list is used below to determine if these proxies are running.
+        for _proc in "haproxy" "${_proxy_list[@]}" ; do
+          CheckProxyProcess "${_proc}"
+        done
+      fi
     fi
 
-    # shellcheck disable=SC2034
-    for _proc in "haproxy" "${_proxy_list[@]}" ; do
-
-      CheckProxyProcess "${_proc}"
-
-    done
 
     printf "\\n     Set processes: \\e[0;39m%d\\e[m\\n" "$init_number"
     printf "           Created: \\e[0;32m%d\\e[m\\n" "$_tor_processes_done"
@@ -684,26 +722,27 @@ function __main__() {
     printf "  Control password: \\e[2;38m%s\\e[m\\n\\n" "$_pass_gen"
 
     # shellcheck disable=SC2154
-    if [[ ${#_proxy_processes_list[@]} -ne 0 ]] && [[ "$proxy_state" -eq 1 ]] ; then
-
-      if [[ "$proxy_type" == "socks" ]] ; then
-
-        printf "       Proxy state: \\e[2;32m%s\\e[m (haproxy » %s)\\n\\n" "running" "$proxy_type"
-
-      elif [[ "$frontend_type" == "haproxy" ]] ; then
-
-        printf "       Proxy state: \\e[2;32m%s\\e[m (haproxy » %s » socks)\\n\\n" "running" "$proxy_type"
-
-      else
-
-        printf "       Proxy state: \\e[2;32m%s\\e[m (%s » haproxy » socks)\\n\\n" "running" "$proxy_type"
-
+    # Update status message
+    if [[ "$proxy_state" -eq 1 ]] ; then
+      if [[ "$proxy_type" == "custom_lb" ]] ; then
+        if [[ "$_custom_lb_active" == true ]] ; then
+          printf "       Proxy state: \\e[2;32m%s\\e[m (custom_lb » Tor SOCKS)\\n\\n" "running"
+        else
+          printf "       Proxy state: \\e[2;31m%s\\e[m (custom_lb failed to start)\\n\\n" "failed"
+        fi
+      elif [[ ${#_proxy_processes_list[@]} -ne 0 ]] ; then # Original HAProxy/etc check for other proxy types
+        if [[ "$proxy_type" == "socks" ]] ; then
+          printf "       Proxy state: \\e[2;32m%s\\e[m (haproxy » %s)\\n\\n" "running" "$proxy_type"
+        elif [[ "$frontend_type" == "haproxy" ]] ; then
+          printf "       Proxy state: \\e[2;32m%s\\e[m (haproxy » %s » socks)\\n\\n" "running" "$proxy_type"
+        else
+          printf "       Proxy state: \\e[2;32m%s\\e[m (%s » haproxy/tor » socks)\\n\\n" "running" "$proxy_type"
+        fi
+      else # This 'else' means proxy_state was 1, not custom_lb, and _proxy_processes_list was empty
+        printf "       Proxy state: \\e[2;31m%s\\e[m (proxy init failed for %s)\\n\\n" "failed" "$proxy_type"
       fi
-
-    else
-
+    else # This 'else' is for when proxy_state is NOT 1 (i.e., --proxy not used)
       printf "       Proxy state: \\e[2;31m%s\\e[m (only tor)\\n\\n" "disable"
-
     fi
 
     # Unset password variables.
@@ -792,6 +831,43 @@ function __main__() {
       kill_status="1"
 
     done
+
+    # Specifically kill the custom_lb.py script if it's running
+    # Using pkill to find the process by its script name.
+    # This is simpler than managing PID files for this specific case within the existing structure immediately.
+    # Make sure this is robust enough or adapt to use PID files later if needed.
+    _custom_lb_pids=$(pgrep -f "python3 ${_lib}/custom_lb.py" || true)
+    if [[ -n "$_custom_lb_pids" ]] ; then
+      _logger "info" \
+        "${_FUNCTION_ID}()" \
+        "Attempting to kill custom_lb.py processes: $_custom_lb_pids"
+      # Using kill directly as DestroyProcess is more for daemons with PID files
+      # and specific multitor structure.
+      # shellcheck disable=SC2046
+      kill $(echo "$_custom_lb_pids") >>"$_log_stdout" 2>&1
+      # Brief pause to allow process to terminate
+      sleep 0.5
+      # Confirm kill
+      _custom_lb_pids_after_kill=$(pgrep -f "python3 ${_lib}/custom_lb.py" || true)
+      if [[ -z "$_custom_lb_pids_after_kill" ]]; then
+        _logger "info" \
+          "${_FUNCTION_ID}()" \
+          "custom_lb.py process(es) killed successfully."
+        kill_status="1"
+      else
+        _logger "warn" \
+          "${_FUNCTION_ID}()" \
+          "Failed to kill all custom_lb.py process(es). PIDs remaining: $_custom_lb_pids_after_kill. Forcing kill."
+        # shellcheck disable=SC2046
+        kill -9 $(echo "$_custom_lb_pids_after_kill") >>"$_log_stdout" 2>&1
+        kill_status="1" # Still set kill_status, as an attempt was made.
+      fi
+    else
+      _logger "info" \
+        "${_FUNCTION_ID}()" \
+        "custom_lb.py process not found, no need to kill."
+    fi
+
 
     if [[ "$kill_status" -eq 1 ]] ; then
 
