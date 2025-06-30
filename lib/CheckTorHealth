@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+
+# shellcheck shell=bash
+
+# ``````````````````````````````````````````````````````````````````````````````
+# Function name: check_tor_instance_health()
+#
+# Description:
+#   Checks if a Tor instance can successfully connect to gstatic.com/generate_204
+#   via its SOCKS proxy and receive an HTTP 204 response.
+#
+# Usage:
+#   check_tor_instance_health SOCKS_PORT
+#
+# Examples:
+#   check_tor_instance_health 9050
+#
+
+function check_tor_instance_health() {
+
+  # shellcheck disable=SC2034
+  local _FUNCTION_ID="check_tor_instance_health"
+  local _STATE=1 # Default to unhealthy
+  local _socks_port="$1"
+
+  # Check if curl is available
+  if ! command -v curl &>/dev/null; then
+    # _logger is not available here as this is a lib file that might be sourced
+    # before _logger is defined. stderr is a safe bet.
+    echo "Error: curl command not found. Cannot check Tor instance health." >&2
+    return 1 # Unhealthy
+  fi
+
+  # Attempt to fetch headers from gstatic.com through the Tor SOCKS proxy
+  # Timeout after 10 seconds if the request hangs.
+  # -s for silent mode (no progress meter)
+  # --head to fetch only headers
+  # -w "%{http_code}" to output only the HTTP status code
+  # http://connectivitycheck.gstatic.com/generate_204 should return 204
+
+  local http_status_code
+  http_status_code=$(timeout 10s curl --socks5-hostname "127.0.0.1:${_socks_port}" \
+    -s --head -w "%{http_code}" \
+    http://connectivitycheck.gstatic.com/generate_204 -o /dev/null)
+
+  local curl_exit_status="$?"
+
+  # Check if curl command was successful AND http status is 204
+  if [[ "$curl_exit_status" -eq 0 ]] && [[ "$http_status_code" -eq 204 ]]; then
+    _STATE=0 # Healthy
+  else
+    # Log failure details if possible (assuming _logger might be available if sourced from main script)
+    # Or simply rely on the exit code for the caller to handle.
+    # For debugging: echo "Health check failed: SOCKS Port=${_socks_port}, Curl Exit=${curl_exit_status}, HTTP Status=${http_status_code}" >&2
+    _STATE=1 # Unhealthy
+  fi
+
+  return $_STATE
+}
