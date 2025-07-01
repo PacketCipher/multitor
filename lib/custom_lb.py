@@ -7,13 +7,18 @@ import argparse
 import socks # PySocks
 
 # Configure logging
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s')
 
-# Shared state for the best proxy
-# Needs a lock for thread-safe updates and reads
-_best_proxy_lock = threading.Lock()
-_best_proxy = None # Will be a tuple (host, port)
-_target_proxies = [] # List of (host, port) tuples
+# --- MODIFIED: Shared state for the round-robin strategy ---
+TOP_N_PROXIES = None # The 'N' in "Top-N" round-robin
+# A lock is needed for thread-safe updates and reads of the shared state.
+_shared_state_lock = threading.Lock()
+# Will be a list of the top N (host, port) tuples, sorted by latency.
+_top_proxies = []
+# Index for round-robin selection. Must be accessed under the lock.
+_round_robin_index = 0
+# Original list of proxies from arguments remains the same.
+_target_proxies = []
 
 # Gstatic URL for health checks
 GSTATIC_URL = "http://clients3.google.com/generate_204"
@@ -33,7 +38,7 @@ def check_proxy_health(proxy_host, proxy_port):
         end_time = time.time()
         if response.status_code == 204:
             latency = end_time - start_time
-            logging.info(f"Proxy {proxy_host}:{proxy_port} healthy, latency: {latency:.4f}s")
+            logging.debug(f"Proxy {proxy_host}:{proxy_port} healthy, latency: {latency:.4f}s")
             return latency
         else:
             logging.warning(f"Proxy {proxy_host}:{proxy_port} unhealthy, status: {response.status_code}")
@@ -43,65 +48,86 @@ def check_proxy_health(proxy_host, proxy_port):
         return float('inf')
 
 def monitor_proxies():
-    """Periodically checks all target proxies and updates the best one."""
-    global _best_proxy
+    """
+    MODIFIED: Periodically checks all target proxies and updates the list of top N fastest ones.
+    """
+    global _top_proxies
     while True:
-        current_best_latency = float('inf')
-        current_best_proxy_candidate = None
-
         if not _target_proxies:
             logging.warning("Monitor: No target proxies configured.")
-            with _best_proxy_lock:
-                _best_proxy = None # Clear best proxy if none are available
+            with _shared_state_lock:
+                _top_proxies = [] # Clear top proxies if none are configured
             time.sleep(MONITORING_INTERVAL)
             continue
 
+        # 1. Check all proxies and collect their latencies
+        healthy_proxies_with_latency = []
         for host, port in _target_proxies:
             latency = check_proxy_health(host, port)
-            if latency < current_best_latency:
-                current_best_latency = latency
-                current_best_proxy_candidate = (host, port)
+            if latency != float('inf'):
+                # Store as (latency, (host, port)) for easy sorting
+                healthy_proxies_with_latency.append((latency, (host, port)))
 
-        with _best_proxy_lock:
-            if current_best_proxy_candidate:
-                if _best_proxy != current_best_proxy_candidate:
-                    logging.info(f"New best proxy: {current_best_proxy_candidate[0]}:{current_best_proxy_candidate[1]} with latency {current_best_latency:.4f}s")
-                    _best_proxy = current_best_proxy_candidate
-                else:
-                    logging.info(f"Best proxy remains {current_best_proxy_candidate[0]}:{current_best_proxy_candidate[1]}")
-            elif _best_proxy is not None:
-                logging.warning("No healthy proxy found, clearing current best proxy.")
-                _best_proxy = None
-            else:
-                logging.info("No healthy proxy found and no best proxy was set.")
+        # 2. Sort by latency (lowest first)
+        healthy_proxies_with_latency.sort(key=lambda x: x[0])
 
+        # 3. Get the new list of top N proxies (without latency info)
+        sorted_proxies = [proxy for latency, proxy in healthy_proxies_with_latency]
+        new_top_proxies = sorted_proxies[:TOP_N_PROXIES]
+
+        # 4. Atomically update the shared list
+        with _shared_state_lock:
+            # Check if the list has actually changed to avoid noisy logs
+            if _top_proxies != new_top_proxies:
+                logging.info(f"Updating top proxies list. New list: {new_top_proxies}")
+                _top_proxies = new_top_proxies
+            elif not new_top_proxies and _top_proxies:
+                 logging.warning("No healthy proxies found. Clearing top proxies list.")
+                 _top_proxies = []
+            elif new_top_proxies:
+                logging.info(f"Top proxies list remains unchanged: {new_top_proxies}")
+            else: # new_top_proxies is empty and _top_proxies was also empty
+                logging.info("Still no healthy proxies found.")
 
         time.sleep(MONITORING_INTERVAL)
 
-def get_best_proxy():
-    """Returns the current best proxy in a thread-safe manner."""
-    with _best_proxy_lock:
-        return _best_proxy
+def select_proxy_round_robin():
+    """
+    NEW: Selects a proxy from the top N list using a round-robin strategy.
+    This is thread-safe.
+    """
+    global _round_robin_index
+    with _shared_state_lock:
+        if not _top_proxies:
+            return None # No healthy proxies available
+
+        # Select proxy using round-robin logic
+        selected_proxy = _top_proxies[_round_robin_index % len(_top_proxies)]
+        _round_robin_index += 1
+        
+        # Prevent the index from growing indefinitely (optional, but good practice)
+        if _round_robin_index > 1000000:
+             _round_robin_index = 0
+
+        return selected_proxy
 
 def handle_client_connection(client_socket, client_address):
-    """Handles a single client connection, forwarding it through the best SOCKS5 proxy."""
+    """Handles a single client connection, forwarding it through a selected SOCKS5 proxy."""
     logging.info(f"Accepted connection from {client_address}")
     proxy_socket = None # Ensure proxy_socket is defined for the finally block
 
     try:
-        # 1. Get the current best SOCKS proxy
-        upstream_proxy = get_best_proxy()
+        # --- MODIFIED: Use the new round-robin selection function ---
+        upstream_proxy = select_proxy_round_robin()
         if not upstream_proxy:
             logging.error(f"No healthy upstream SOCKS proxy available for {client_address}. Closing connection.")
-            # Note: We can't send a SOCKS error yet as we haven't done the handshake. Just close.
             client_socket.close()
             return
 
         upstream_host, upstream_port = upstream_proxy
-        logging.info(f"Selected upstream SOCKS proxy {upstream_host}:{upstream_port} for {client_address}")
+        logging.info(f"Selected upstream SOCKS proxy {upstream_host}:{upstream_port} for {client_address} via round-robin")
 
         # 2. SOCKS5 handshake with the client (Version identifier/method selection)
-        # This part remains the same as the original code.
         version_id_msg = client_socket.recv(2)
         if not version_id_msg or len(version_id_msg) < 2:
             logging.warning(f"Client {client_address} sent incomplete version/nmethods. Closing.")
@@ -119,7 +145,6 @@ def handle_client_connection(client_socket, client_address):
         client_socket.sendall(b'\x05\x00') # Select NO AUTH method
 
         # 3. SOCKS5 client request (get destination from client)
-        # This part also remains the same.
         client_req_header = client_socket.recv(4)
         if not client_req_header or len(client_req_header) < 4:
             logging.warning(f"Client {client_address} sent incomplete request header. Closing."); client_socket.close(); return
@@ -142,17 +167,15 @@ def handle_client_connection(client_socket, client_address):
             client_socket.sendall(b'\x05\x08\x00\x01\x00\x00\x00\x00\x00\x00'); client_socket.close(); return
         
         dst_port_bytes = client_socket.recv(2)
-        if len(dst_addr_bytes) < 1 or len(dst_port_bytes) < 2: # Basic check
+        if len(dst_addr_bytes) < 1 or len(dst_port_bytes) < 2:
              logging.warning(f"Client {client_address} sent incomplete address/port. Closing."); client_socket.close(); return
 
         # 4. Connect and handshake with the upstream SOCKS proxy
-        # *** THIS IS THE MAIN CORRECTED SECTION ***
         logging.debug(f"Connecting to upstream proxy {upstream_host}:{upstream_port}")
         proxy_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         proxy_socket.settimeout(10)
         proxy_socket.connect((upstream_host, upstream_port))
 
-        # Perform SOCKS5 handshake with upstream proxy (we offer NO AUTH)
         proxy_socket.sendall(b'\x05\x01\x00')
         server_choice = proxy_socket.recv(2)
         if len(server_choice) < 2 or server_choice[0] != 0x05 or server_choice[1] != 0x00:
@@ -164,7 +187,6 @@ def handle_client_connection(client_socket, client_address):
         proxy_socket.sendall(upstream_request)
 
         # 6. Relay reply from upstream proxy back to client
-        # This logic is complex, so we read and forward it chunk by chunk to be safe.
         proxy_reply_header = proxy_socket.recv(4)
         if not proxy_reply_header or len(proxy_reply_header) < 4:
             raise ConnectionAbortedError("Upstream proxy closed connection before sending reply header.")
@@ -173,15 +195,14 @@ def handle_client_connection(client_socket, client_address):
         reply_atyp = proxy_reply_header[3]
         
         bnd_len = 0
-        if reply_atyp == 0x01: bnd_len = 4 # IPv4
-        elif reply_atyp == 0x04: bnd_len = 16 # IPv6
-        elif reply_atyp == 0x03: # Domain
+        if reply_atyp == 0x01: bnd_len = 4
+        elif reply_atyp == 0x04: bnd_len = 16
+        elif reply_atyp == 0x03:
             len_byte = proxy_socket.recv(1)
             client_socket.sendall(len_byte)
             bnd_len = len_byte[0]
         
-        # Forward BND.ADDR and BND.PORT
-        bnd_full = proxy_socket.recv(bnd_len + 2) # Address + 2-byte port
+        bnd_full = proxy_socket.recv(bnd_len + 2)
         client_socket.sendall(bnd_full)
 
         # 7. Relay data
@@ -190,16 +211,14 @@ def handle_client_connection(client_socket, client_address):
             relay_data(client_socket, proxy_socket, client_address)
         else:
             logging.error(f"Upstream SOCKS proxy {upstream_host}:{upstream_port} failed request for {client_address}. REP: {proxy_reply_header[1]}.")
-            # Error reply has been forwarded, just close.
 
     except (socket.error, socks.SOCKS5Error, BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as e:
         logging.error(f"Error during SOCKS relay for {client_address}: {e}")
-        # Try to send a general failure to client if the connection is still open
         if not client_socket._closed:
             try:
                 client_socket.sendall(b'\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00')
             except socket.error:
-                pass # Ignore if we can't even send the error
+                pass
     finally:
         if client_socket and not client_socket._closed:
             client_socket.close()
@@ -215,37 +234,31 @@ def relay_data(sock1, sock2, client_address):
         try:
             while not done_event.is_set():
                 data = s_from.recv(4096)
-                if not data: # Connection closed by peer
+                if not data:
                     break
                 s_to.sendall(data)
         except (socket.error, BrokenPipeError, ConnectionResetError) as e:
-            if not done_event.is_set(): # Avoid logging if already shutting down
+            if not done_event.is_set():
                  logging.debug(f"Socket error during relay ({direction}) for {client_address}: {e}")
         finally:
-            done_event.set() # Signal the other forwarder to stop
+            done_event.set()
 
-    # Start forwarding in both directions
     t1 = threading.Thread(target=_forward, args=(sock1, sock2, "client_to_proxy"))
     t2 = threading.Thread(target=_forward, args=(sock2, sock1, "proxy_to_client"))
-    t1.daemon = True # Ensure threads don't block program exit
+    t1.daemon = True
     t2.daemon = True
     t1.start()
     t2.start()
-
-    # Wait for either direction to complete (or error out)
     done_event.wait()
-
-    # Attempt to close sockets if they aren't already
     for s in [sock1, sock2]:
         if not s._closed:
             try:
                 s.shutdown(socket.SHUT_RDWR)
             except socket.error:
-                pass # Ignore errors if already closed or problematic
+                pass
             finally:
                 s.close()
     logging.debug(f"Relay finished for {client_address}")
-
 
 def start_server(listen_host, listen_port):
     """Starts the SOCKS5 proxy server and listens for connections."""
@@ -253,8 +266,9 @@ def start_server(listen_host, listen_port):
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         server_socket.bind((listen_host, listen_port))
-        server_socket.listen(128) # Max backlog connections
+        server_socket.listen(128)
         logging.info(f"Custom LB SOCKS5 Proxy listening on {listen_host}:{listen_port}")
+        logging.info(f"Strategy: Round-robin top {TOP_N_PROXIES} proxies.")
     except socket.error as e:
         logging.error(f"Failed to bind or listen on {listen_host}:{listen_port}: {e}")
         return
@@ -263,22 +277,20 @@ def start_server(listen_host, listen_port):
         try:
             client_socket, client_address = server_socket.accept()
             client_thread = threading.Thread(target=handle_client_connection, args=(client_socket, client_address))
-            client_thread.daemon = True # Don't let threads block exit
+            client_thread.daemon = True
             client_thread.start()
         except KeyboardInterrupt:
             logging.info("Server shutting down on KeyboardInterrupt.")
             break
         except socket.error as e:
             logging.error(f"Socket error during accept: {e}")
-            # Potentially add a small delay here if accept is failing rapidly
             time.sleep(0.1)
 
     server_socket.close()
     logging.info("Server stopped.")
 
-
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Custom SOCKS5 Load Balancer for Tor.")
+    parser = argparse.ArgumentParser(description="Custom SOCKS5 Load Balancer for Tor with Round-Robin.")
     parser.add_argument("--listen-host", type=str, required=True, help="Host to listen on (e.g., 127.0.0.1)")
     parser.add_argument("--listen-port", type=int, required=True, help="Port to listen on (e.g., 16378)")
     parser.add_argument("--tor-proxies", type=str, required=True,
@@ -286,7 +298,6 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    # Parse Tor proxies
     try:
         for proxy_str in args.tor_proxies.split(','):
             if not proxy_str.strip(): continue
@@ -300,12 +311,12 @@ if __name__ == "__main__":
         logging.error(f"Invalid format for --tor-proxies: {args.tor_proxies}. Error: {e}. Exiting.")
         exit(1)
 
-    # Start the monitoring thread
+    TOP_N_PROXIES = len(args.tor_proxies.split(','))
+
     monitor_thread = threading.Thread(target=monitor_proxies)
-    monitor_thread.daemon = True # So it exits when the main thread exits
+    monitor_thread.daemon = True
     monitor_thread.start()
 
-    # Start the server
     try:
         start_server(args.listen_host, args.listen_port)
     except Exception as e:
