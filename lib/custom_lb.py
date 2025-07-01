@@ -204,10 +204,14 @@ def monitor_proxies():
         # 1. Check all proxies and collect their latencies
         healthy_proxies_with_latency = []
         for host, port in _target_proxies:
-            latency = check_func(host, port)
-            if latency != float('inf'):
-                # Store as (latency, (host, port)) for easy sorting
-                healthy_proxies_with_latency.append((latency, (host, port)))
+            try:
+                latency = check_func(host, port)
+                if latency != float('inf'):
+                    # Store as (latency, (host, port)) for easy sorting
+                    healthy_proxies_with_latency.append((latency, (host, port)))
+            except Exception as e:
+                print(e)
+                continue
 
         # 2. Sort by latency (lowest first)
         healthy_proxies_with_latency.sort(key=lambda x: x[0])
