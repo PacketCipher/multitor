@@ -354,6 +354,8 @@ if __name__ == "__main__":
     parser.add_argument("--listen-port", type=int, required=True, help="Port to listen on (e.g., 16378)")
     parser.add_argument("--tor-proxies", type=str, required=True,
                         help="Comma-separated list of Tor SOCKS5 proxies (e.g., 127.0.0.1:9050,127.0.0.1:9051)")
+    parser.add_argument("--top-n-proxies", type=str, required=True,
+                        help="Comma-separated list of Tor SOCKS5 proxies (e.g., 127.0.0.1:9050,127.0.0.1:9051)")
 
     args = parser.parse_args()
 
@@ -370,7 +372,11 @@ if __name__ == "__main__":
         logging.error(f"Invalid format for --tor-proxies: {args.tor_proxies}. Error: {e}. Exiting.")
         exit(1)
 
-    TOP_N_PROXIES = len(args.tor_proxies.split(',')) // 3
+    # wait a minute for connection
+    time.sleep(60)
+
+    # TOP_N_PROXIES = len(args.tor_proxies.split(',')) // 3
+    TOP_N_PROXIES = args.top_n_proxies
 
     monitor_thread = threading.Thread(target=monitor_proxies)
     monitor_thread.daemon = True
