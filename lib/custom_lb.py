@@ -5,6 +5,7 @@ import requests
 import logging
 import argparse
 import socks # PySocks
+from concurrent.futures import ThreadPoolExecutor
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s')
@@ -21,31 +22,89 @@ _round_robin_index = 0
 _target_proxies = []
 
 # Gstatic URL for health checks
-GSTATIC_URL = "http://clients3.google.com/generate_204"
+TEST_URL = "http://connectivitycheck.gstatic.com/generate_204"
 HEALTH_CHECK_TIMEOUT = 5 # seconds
-MONITORING_INTERVAL = 60 # seconds
+MONITORING_INTERVAL = 5 * 60 # seconds
 
-def check_proxy_health(proxy_host, proxy_port):
-    """Checks the health of a single SOCKS5 proxy by timing a request to GSTATIC_URL."""
+def check_proxy_health(proxy_host, proxy_port, num_rounds=10, requests_per_round=10):
+    """
+    Measures proxy performance by running multiple rounds of parallel requests.
+
+    In each round, a batch of requests are sent concurrently. This process is
+    repeated for the specified number of rounds. Failed requests are penalized
+    with a latency equal to HEALTH_CHECK_TIMEOUT.
+
+    Args:
+        proxy_host (str): The proxy server hostname or IP address.
+        proxy_port (int): The proxy server port.
+        num_rounds (int): The number of times to run the parallel test. Defaults to 10.
+        requests_per_round (int): The number of parallel requests to make in each round. Defaults to 10.
+
+    Returns:
+        float: The overall average latency in seconds across all requests.
+    """
+    total_requests = num_rounds * requests_per_round
+    print(
+        f"--- Starting Performance Test for {proxy_host}:{proxy_port} ---\n"
+        f"Configuration: {num_rounds} rounds, {requests_per_round} parallel requests per round "
+        f"({total_requests} total requests)."
+    )
+    
+    # A single, thread-safe session is more efficient for multiple requests.
     session = requests.Session()
     session.proxies = {
         'http': f'socks5h://{proxy_host}:{proxy_port}',
         'https': f'socks5h://{proxy_host}:{proxy_port}'
     }
-    try:
-        start_time = time.time()
-        response = session.get(GSTATIC_URL, timeout=HEALTH_CHECK_TIMEOUT)
-        end_time = time.time()
-        if response.status_code == 204:
-            latency = end_time - start_time
-            logging.debug(f"Proxy {proxy_host}:{proxy_port} healthy, latency: {latency:.4f}s")
-            return latency
-        else:
-            logging.warning(f"Proxy {proxy_host}:{proxy_port} unhealthy, status: {response.status_code}")
-            return float('inf')
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Proxy {proxy_host}:{proxy_port} error: {e}")
-        return float('inf')
+
+    # This nested function is the "worker" that each thread will execute.
+    def _make_single_request():
+        try:
+            start_time = time.time()
+            response = session.get(TEST_URL, timeout=HEALTH_CHECK_TIMEOUT)
+            end_time = time.time()
+            # The gstatic URL returns 204 on success. response.ok checks for any 2xx status.
+            if response.status_code == 204:
+                return end_time - start_time
+            # Request succeeded but returned an unexpected status, assign penalty
+            return HEALTH_CHECK_TIMEOUT
+        except requests.exceptions.RequestException:
+            # Request failed (e.g., timeout, connection error), assign penalty
+            return HEALTH_CHECK_TIMEOUT
+
+    all_latencies = []
+    total_start_time = time.time()
+
+    # The outer loop for each round of tests
+    for i in range(num_rounds):
+        round_start_time = time.time()
+        
+        with ThreadPoolExecutor(max_workers=requests_per_round) as executor:
+            futures = [executor.submit(_make_single_request) for _ in range(requests_per_round)]
+            round_latencies = [f.result() for f in futures]
+        
+        all_latencies.extend(round_latencies)
+        round_duration = time.time() - round_start_time
+        round_avg_latency = sum(round_latencies) / len(round_latencies)
+
+        print(f"Round {i + 1}/{num_rounds} completed in {round_duration:.2f}s. "
+              f"Avg latency for this round: {round_avg_latency:.4f}s")
+
+    # --- Final Summary Calculation ---
+    total_duration = time.time() - total_start_time
+    overall_avg_latency = sum(all_latencies) / len(all_latencies)
+    success_count = sum(1 for lat in all_latencies if lat < HEALTH_CHECK_TIMEOUT)
+    success_rate = (success_count / total_requests) * 100
+
+    print("\n--- Performance Test Summary ---")
+    print(f"Total requests made: {total_requests}")
+    print(f"Successful requests: {success_count} ({success_rate:.1f}%)")
+    print(f"Total time taken:    {total_duration:.4f} seconds")
+    print(f"Overall avg latency: {overall_avg_latency:.4f}s (includes penalties for failures)")
+    print("---------------------------------")
+    
+    return overall_avg_latency
+
 
 def monitor_proxies():
     """
