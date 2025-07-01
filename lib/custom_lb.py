@@ -311,7 +311,7 @@ if __name__ == "__main__":
         logging.error(f"Invalid format for --tor-proxies: {args.tor_proxies}. Error: {e}. Exiting.")
         exit(1)
 
-    TOP_N_PROXIES = len(args.tor_proxies.split(','))
+    TOP_N_PROXIES = len(args.tor_proxies.split(',')) // 3
 
     monitor_thread = threading.Thread(target=monitor_proxies)
     monitor_thread.daemon = True
