@@ -44,14 +44,16 @@ if [[ "$1" == "install" ]] ; then
       apt-get update -qq
       if apt-get install -y tor python3-requests python3-pysocks; then
         printf "%s\\n" "Successfully installed tor, python3-requests, and python3-pysocks."
+      elif apt-get install -y tor python3-requests python3-socks; then
+        printf "%s\\n" "Successfully installed tor, python3-requests, and python3-socks (used python3-socks as fallback for python3-pysocks)."
       else
-        printf "%s\\n" "WARNING: Failed to install some dependencies (tor, python3-requests, python3-pysocks). Required features may not work."
-        printf "%s\\n" "Please try installing them manually (e.g., sudo apt-get install tor python3-requests python3-pysocks)."
+        printf "%s\\n" "WARNING: Failed to install some dependencies (tor, python3-requests, python3-pysocks/python3-socks). Required features may not work."
+        printf "%s\\n" "Please try installing them manually (e.g., sudo apt-get install tor python3-requests python3-pysocks or python3-socks)."
       fi
     fi
   else
     printf "%s\\n" "WARNING: 'apt-get' not found. Cannot automatically install Python dependencies."
-    printf "%s\\n" "Please ensure 'python3-requests' and 'python3-pysocks' are installed for custom_lb functionality."
+    printf "%s\\n" "Please ensure 'python3-requests' and 'python3-pysocks' (or 'python3-socks') are installed for custom_lb functionality."
   fi
   printf "%s\\n" "--------------------------------------------------------------------"
 
