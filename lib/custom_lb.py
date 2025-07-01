@@ -354,7 +354,7 @@ if __name__ == "__main__":
     parser.add_argument("--listen-port", type=int, required=True, help="Port to listen on (e.g., 16378)")
     parser.add_argument("--tor-proxies", type=str, required=True,
                         help="Comma-separated list of Tor SOCKS5 proxies (e.g., 127.0.0.1:9050,127.0.0.1:9051)")
-    parser.add_argument("--top-n-proxies", type=str, required=True,
+    parser.add_argument("--top-n-proxies", type=int, required=True,
                         help="Comma-separated list of Tor SOCKS5 proxies (e.g., 127.0.0.1:9050,127.0.0.1:9051)")
 
     args = parser.parse_args()

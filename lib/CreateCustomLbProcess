@@ -75,8 +75,8 @@ function CreateCustomLbProcess() {
   nohup python3 "$_python_script_path" \
     --listen-host "$_lb_listen_host" \
     --listen-port "$_lb_listen_port" \
-    --tor-proxies "$_tor_proxies_list" >> "$_log_stdout" 2>&1 \
-    --top-n-proxies "$_lb_top_n_proxies" &
+    --tor-proxies "$_tor_proxies_list" \
+    --top-n-proxies "$_lb_top_n_proxies" >> "$_log_stdout" 2>&1 &
 
   local _py_pid=$!
 
