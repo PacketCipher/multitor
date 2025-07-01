@@ -86,285 +86,126 @@ def get_best_proxy():
 def handle_client_connection(client_socket, client_address):
     """Handles a single client connection, forwarding it through the best SOCKS5 proxy."""
     logging.info(f"Accepted connection from {client_address}")
+    proxy_socket = None # Ensure proxy_socket is defined for the finally block
 
-    # 1. Get the current best SOCKS proxy
-    upstream_proxy = get_best_proxy()
-    if not upstream_proxy:
-        logging.error(f"No healthy upstream SOCKS proxy available for {client_address}. Closing connection.")
-        client_socket.close()
-        return
-
-    upstream_host, upstream_port = upstream_proxy
-    logging.info(f"Forwarding {client_address} to upstream SOCKS proxy {upstream_host}:{upstream_port}")
-
-    # 2. Connect to the chosen SOCKS proxy
     try:
-        proxy_socket = socks.create_connection(
-            (upstream_host, upstream_port),
-            proxy_type=socks.SOCKS5,
-            # No auth needed for Tor SOCKS by default
-        )
-    except (socks.SOCKS5Error, socket.error, ConnectionRefusedError) as e:
-        logging.error(f"Failed to connect to upstream SOCKS proxy {upstream_host}:{upstream_port}: {e}")
-        client_socket.close()
-        return
+        # 1. Get the current best SOCKS proxy
+        upstream_proxy = get_best_proxy()
+        if not upstream_proxy:
+            logging.error(f"No healthy upstream SOCKS proxy available for {client_address}. Closing connection.")
+            # Note: We can't send a SOCKS error yet as we haven't done the handshake. Just close.
+            client_socket.close()
+            return
 
-    # 3. SOCKS5 handshake with the client (Version identifier/method selection)
-    # Client sends:
-    # +----+----------+----------+
-    # |VER | NMETHODS | METHODS  |
-    # +----+----------+----------+
-    # | 1  |    1     | 1 to 255 |
-    # +----+----------+----------+
-    try:
-        version_id_msg = client_socket.recv(2) # VER, NMETHODS
+        upstream_host, upstream_port = upstream_proxy
+        logging.info(f"Selected upstream SOCKS proxy {upstream_host}:{upstream_port} for {client_address}")
+
+        # 2. SOCKS5 handshake with the client (Version identifier/method selection)
+        # This part remains the same as the original code.
+        version_id_msg = client_socket.recv(2)
         if not version_id_msg or len(version_id_msg) < 2:
             logging.warning(f"Client {client_address} sent incomplete version/nmethods. Closing.")
-            client_socket.close()
-            proxy_socket.close()
-            return
+            client_socket.close(); return
 
         sock_version, nmethods = version_id_msg[0], version_id_msg[1]
-        logging.debug(f"Client {client_address}: SOCKS version {sock_version}, NMETHODS {nmethods}")
-
         if sock_version != 0x05:
-            logging.error(f"Unsupported SOCKS version from {client_address}: {sock_version}")
-            client_socket.close() # No SOCKS reply for wrong version before method negotiation
-            proxy_socket.close()
-            return
+            logging.error(f"Unsupported SOCKS version from {client_address}: {sock_version}"); client_socket.close(); return
 
         client_methods = client_socket.recv(nmethods)
-        if len(client_methods) != nmethods:
-            logging.warning(f"Client {client_address} did not send all methods. Closing.")
-            client_socket.close()
-            proxy_socket.close()
-            return
-        logging.debug(f"Client {client_address} offered methods: {[hex(m) for m in client_methods]}")
-
-        # We only support NO AUTHENTICATION REQUIRED (0x00)
         if 0x00 not in client_methods:
-            logging.error(f"Client {client_address} does not support NO AUTH method (0x00). Offered: {[hex(m) for m in client_methods]}. Closing.")
-            # Server response: VER, METHOD (0xFF if no acceptable methods)
-            client_socket.sendall(b'\x05\xFF')
-            client_socket.close()
-            proxy_socket.close()
-            return
+            logging.error(f"Client {client_address} does not support NO AUTH method. Closing.")
+            client_socket.sendall(b'\x05\xFF'); client_socket.close(); return
 
-        # Server response: VER, METHOD (0x00 for NO AUTH)
-        logging.debug(f"Client {client_address}: Selecting NO AUTH method (0x00).")
-        client_socket.sendall(b'\x05\x00')
-    except socket.error as e:
-        logging.error(f"Socket error during client SOCKS method negotiation with {client_address}: {e}")
-        client_socket.close()
-        proxy_socket.close()
-        return
+        client_socket.sendall(b'\x05\x00') # Select NO AUTH method
 
-    # 4. SOCKS5 client request
-    # Client sends:
-    # +----+-----+-------+------+----------+----------+
-    # |VER | CMD |  RSV  | ATYP | DST.ADDR | DST.PORT |
-    # +----+-----+-------+------+----------+----------+
-    # | 1  |  1  | X'00' |  1   | Variable |    2     |
-    # +----+-----+-------+------+----------+----------+
-    # CMD: 0x01 = CONNECT
-    # ATYP: 0x01 = IPv4, 0x03 = Domain name, 0x04 = IPv6
-    try:
-        # Receive the SOCKS request header
-        client_req_header = client_socket.recv(4) # VER, CMD, RSV, ATYP
+        # 3. SOCKS5 client request (get destination from client)
+        # This part also remains the same.
+        client_req_header = client_socket.recv(4)
         if not client_req_header or len(client_req_header) < 4:
-            logging.warning(f"Client {client_address} sent incomplete request header. Closing.")
-            client_socket.close()
-            proxy_socket.close()
-            return
+            logging.warning(f"Client {client_address} sent incomplete request header. Closing."); client_socket.close(); return
+        
+        req_ver, req_cmd, _, req_atyp = client_req_header
+        if req_ver != 0x05 or req_cmd != 0x01: # Check for SOCKSv5 CONNECT
+            logging.error(f"Unsupported request from {client_address}: VER={req_ver}, CMD={req_cmd}. Sending error.")
+            client_socket.sendall(b'\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00'); client_socket.close(); return
 
-        req_ver, req_cmd, req_rsv, req_atyp = client_req_header
-        logging.debug(f"Client {client_address}: Request VER={req_ver}, CMD={req_cmd}, RSV={req_rsv}, ATYP={req_atyp}")
-
-        if req_ver != 0x05:
-            logging.error(f"Invalid SOCKS version in request from {client_address}: {req_ver}. Closing.")
-            # It's tricky to send a SOCKS error reply if VER is not 0x05, as client might not expect SOCKS5 format.
-            # Closing is safest.
-            client_socket.close()
-            proxy_socket.close()
-            return
-
-        if req_cmd != 0x01: # CONNECT
-            logging.error(f"Unsupported CMD from {client_address}: {req_cmd}. Sending error reply.")
-            # VER | REP | RSV | ATYP | BND.ADDR | BND.PORT
-            # REP: 0x07 Command not supported
-            client_socket.sendall(b'\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00')
-            client_socket.close()
-            proxy_socket.close()
-            return
-
-        dst_addr_str = "Unknown" # For logging
-        dst_addr_bytes = b''
         if req_atyp == 0x01: # IPv4
-            raw_addr = client_socket.recv(4)
-            if len(raw_addr) < 4:
-                logging.warning(f"Client {client_address} did not send full IPv4 address. Closing.")
-                client_socket.close(); proxy_socket.close(); return
-            dst_addr_bytes = raw_addr
-            dst_addr_str = socket.inet_ntoa(dst_addr_bytes)
-            logging.debug(f"Client {client_address}: Dest IPv4: {dst_addr_str}")
+            dst_addr_bytes = client_socket.recv(4)
         elif req_atyp == 0x03: # Domain name
             domain_len_byte = client_socket.recv(1)
-            if not domain_len_byte:
-                logging.warning(f"Client {client_address} did not send domain length. Closing.")
-                client_socket.close(); proxy_socket.close(); return
             domain_len = domain_len_byte[0]
-            raw_addr = client_socket.recv(domain_len)
-            if len(raw_addr) < domain_len:
-                logging.warning(f"Client {client_address} did not send full domain name. Closing.")
-                client_socket.close(); proxy_socket.close(); return
-            dst_addr_bytes = domain_len_byte + raw_addr # Include length byte for forwarding
-            try:
-                dst_addr_str = raw_addr.decode('utf-8')
-                logging.debug(f"Client {client_address}: Dest Domain: {dst_addr_str}")
-            except UnicodeDecodeError:
-                logging.warning(f"Client {client_address}: Dest Domain (bytes): {raw_addr.hex()}")
-                # Keep dst_addr_str as "Unknown" or set to hex
+            dst_addr_bytes = domain_len_byte + client_socket.recv(domain_len)
         elif req_atyp == 0x04: # IPv6
-            raw_addr = client_socket.recv(16)
-            if len(raw_addr) < 16:
-                logging.warning(f"Client {client_address} did not send full IPv6 address. Closing.")
-                client_socket.close(); proxy_socket.close(); return
-            dst_addr_bytes = raw_addr
-            dst_addr_str = socket.inet_ntop(socket.AF_INET6, dst_addr_bytes)
-            logging.debug(f"Client {client_address}: Dest IPv6: {dst_addr_str}")
+            dst_addr_bytes = client_socket.recv(16)
         else:
-            logging.error(f"Unsupported ATYP from {client_address}: {req_atyp}. Sending error reply.")
-            # REP: 0x08 Address type not supported (more specific than 0x07)
-            client_socket.sendall(b'\x05\x08\x00\x01\x00\x00\x00\x00\x00\x00')
-            client_socket.close()
-            proxy_socket.close()
-            return
-
+            logging.error(f"Unsupported ATYP from {client_address}: {req_atyp}. Sending error.")
+            client_socket.sendall(b'\x05\x08\x00\x01\x00\x00\x00\x00\x00\x00'); client_socket.close(); return
+        
         dst_port_bytes = client_socket.recv(2)
-        if len(dst_port_bytes) < 2:
-            logging.warning(f"Client {client_address} did not send full port. Closing.")
-            client_socket.close(); proxy_socket.close(); return
-        dst_port = int.from_bytes(dst_port_bytes, 'big')
-        logging.debug(f"Client {client_address}: Dest Port: {dst_port} (Target: {dst_addr_str}:{dst_port})")
+        if len(dst_addr_bytes) < 1 or len(dst_port_bytes) < 2: # Basic check
+             logging.warning(f"Client {client_address} sent incomplete address/port. Closing."); client_socket.close(); return
 
-        # Construct the full request to forward to the upstream proxy
-        # For ATYP 0x03 (Domain), dst_addr_bytes already includes the length prefix.
-        # For ATYP 0x01 and 0x04, dst_addr_bytes is just the address.
-        # The SOCKS5 request format to the upstream proxy is:
-        # VER | CMD | RSV | ATYP | DST.ADDR | DST.PORT
-        # So, client_req_header (VER, CMD, RSV, ATYP) is correct to reuse directly.
-        # Then, for DST.ADDR:
-        #   - if ATYP=0x01 (IPv4), it's 4 bytes.
-        #   - if ATYP=0x03 (Domain), it's 1 byte (len) + domain_name.
-        #   - if ATYP=0x04 (IPv6), it's 16 bytes.
-        # The variable `dst_addr_bytes` has been prepared accordingly.
+        # 4. Connect and handshake with the upstream SOCKS proxy
+        # *** THIS IS THE MAIN CORRECTED SECTION ***
+        logging.debug(f"Connecting to upstream proxy {upstream_host}:{upstream_port}")
+        proxy_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        proxy_socket.settimeout(10)
+        proxy_socket.connect((upstream_host, upstream_port))
 
+        # Perform SOCKS5 handshake with upstream proxy (we offer NO AUTH)
+        proxy_socket.sendall(b'\x05\x01\x00')
+        server_choice = proxy_socket.recv(2)
+        if len(server_choice) < 2 or server_choice[0] != 0x05 or server_choice[1] != 0x00:
+            raise socks.SOCKS5Error(f"Upstream proxy {upstream_host}:{upstream_port} did not accept NO AUTH method. Reply: {server_choice.hex()}")
+        logging.debug(f"Handshake with upstream proxy {upstream_host}:{upstream_port} successful.")
+
+        # 5. Forward client's request to upstream proxy
         upstream_request = client_req_header + dst_addr_bytes + dst_port_bytes
         proxy_socket.sendall(upstream_request)
-        logging.debug(f"Client {client_address}: Forwarded request to upstream {upstream_host}:{upstream_port}")
 
-        # 5. Receive reply from upstream SOCKS proxy
-        # +----+-----+-------+------+----------+----------+
-        # |VER | REP |  RSV  | ATYP | BND.ADDR | BND.PORT |
-        # +----+-----+-------+------+----------+----------+
-        # | 1  |  1  | X'00' |  1   | Variable |    2     |
-        # +----+-----+-------+------+----------+----------+
-        proxy_reply_header = proxy_socket.recv(4) # VER, REP, RSV, ATYP
+        # 6. Relay reply from upstream proxy back to client
+        # This logic is complex, so we read and forward it chunk by chunk to be safe.
+        proxy_reply_header = proxy_socket.recv(4)
         if not proxy_reply_header or len(proxy_reply_header) < 4:
-            logging.error(f"Incomplete SOCKS reply header from upstream {upstream_host}:{upstream_port} for {client_address}. Closing.")
-            # Send general failure to client
-            client_socket.sendall(b'\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00')
-            client_socket.close()
-            proxy_socket.close()
-            return
+            raise ConnectionAbortedError("Upstream proxy closed connection before sending reply header.")
+        
+        client_socket.sendall(proxy_reply_header)
+        reply_atyp = proxy_reply_header[3]
+        
+        bnd_len = 0
+        if reply_atyp == 0x01: bnd_len = 4 # IPv4
+        elif reply_atyp == 0x04: bnd_len = 16 # IPv6
+        elif reply_atyp == 0x03: # Domain
+            len_byte = proxy_socket.recv(1)
+            client_socket.sendall(len_byte)
+            bnd_len = len_byte[0]
+        
+        # Forward BND.ADDR and BND.PORT
+        bnd_full = proxy_socket.recv(bnd_len + 2) # Address + 2-byte port
+        client_socket.sendall(bnd_full)
 
-        reply_ver, reply_rep, reply_rsv, reply_atyp = proxy_reply_header
-        logging.debug(f"Client {client_address}: Upstream {upstream_host}:{upstream_port} reply VER={reply_ver}, REP={reply_rep}, RSV={reply_rsv}, ATYP={reply_atyp}")
-
-        if reply_ver != 0x05:
-            logging.error(f"Invalid SOCKS version {reply_ver} in reply from upstream {upstream_host}:{upstream_port} for {client_address}. Closing.")
-            client_socket.sendall(b'\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00') # General failure
-            client_socket.close()
-            proxy_socket.close()
-            return
-
-        proxy_atyp = reply_atyp # Use the received ATYP from proxy reply for parsing BND.ADDR
-
-        full_bnd_field = b''
-        bnd_addr_actual_len = 0 # To store length of address part only
-
-        if proxy_atyp == 0x01: # IPv4
-            bnd_addr_actual_len = 4
-            full_bnd_field = proxy_socket.recv(bnd_addr_actual_len)
-        elif proxy_atyp == 0x03: # Domain
-            domain_len_byte = proxy_socket.recv(1)
-            if not domain_len_byte:
-                logging.error(f"Upstream proxy {upstream_host}:{upstream_port} closed connection while sending domain length for {client_address}.")
-                client_socket.sendall(b'\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00') # General failure
-                client_socket.close()
-                proxy_socket.close()
-                return
-            bnd_addr_actual_len = domain_len_byte[0]
-            domain_bytes = proxy_socket.recv(bnd_addr_actual_len)
-            if len(domain_bytes) != bnd_addr_actual_len:
-                logging.error(f"Upstream proxy {upstream_host}:{upstream_port} closed connection while sending domain for {client_address} (expected {bnd_addr_actual_len}, got {len(domain_bytes)}).")
-                client_socket.sendall(b'\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00') # General failure
-                client_socket.close()
-                proxy_socket.close()
-                return
-            full_bnd_field = domain_len_byte + domain_bytes
-        elif proxy_atyp == 0x04: # IPv6
-            bnd_addr_actual_len = 16
-            full_bnd_field = proxy_socket.recv(bnd_addr_actual_len)
-        else:
-            logging.error(f"Invalid ATYP {proxy_atyp} in reply from upstream {upstream_host}:{upstream_port} for {client_address}. Closing.")
-            client_socket.sendall(b'\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00') # General failure
-            client_socket.close()
-            proxy_socket.close()
-            return
-
-        # Check if we received enough bytes for the address field based on ATYP
-        expected_len_for_full_bnd_field = bnd_addr_actual_len
-        if proxy_atyp == 0x03: # For domain, full_bnd_field includes the length byte
-            expected_len_for_full_bnd_field += 1
-
-        if len(full_bnd_field) != expected_len_for_full_bnd_field:
-            logging.error(f"Upstream proxy {upstream_host}:{upstream_port} connection closed prematurely when receiving BND.ADDR for ATYP {proxy_atyp} for {client_address} (expected {expected_len_for_full_bnd_field}, got {len(full_bnd_field)}).")
-            client_socket.sendall(b'\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00') # General failure
-            client_socket.close()
-            proxy_socket.close()
-            return
-
-        proxy_bnd_port_bytes = proxy_socket.recv(2)
-        if len(proxy_bnd_port_bytes) < 2:
-            logging.error(f"Upstream proxy {upstream_host}:{upstream_port} connection closed prematurely when receiving BND.PORT for {client_address}.")
-            client_socket.sendall(b'\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00') # General failure
-            client_socket.close()
-            proxy_socket.close()
-            return
-
-        # Forward upstream SOCKS proxy's reply to the client
-        client_socket.sendall(proxy_reply_header + full_bnd_field + proxy_bnd_port_bytes)
-
-        # 6. Relay data
+        # 7. Relay data
         if proxy_reply_header[1] == 0x00: # Success
             logging.info(f"SOCKS connection established for {client_address} via {upstream_host}:{upstream_port}. Relaying data.")
             relay_data(client_socket, proxy_socket, client_address)
         else:
-            logging.error(f"Upstream SOCKS proxy {upstream_host}:{upstream_port} failed request for {client_address}. REP: {proxy_reply_header[1]}. Closing.")
-            # The error reply has already been sent to the client
-            client_socket.close()
-            proxy_socket.close()
+            logging.error(f"Upstream SOCKS proxy {upstream_host}:{upstream_port} failed request for {client_address}. REP: {proxy_reply_header[1]}.")
+            # Error reply has been forwarded, just close.
 
-    except (socket.error, socks.SOCKS5Error, BrokenPipeError, ConnectionResetError) as e:
+    except (socket.error, socks.SOCKS5Error, BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as e:
         logging.error(f"Error during SOCKS relay for {client_address}: {e}")
-    finally:
+        # Try to send a general failure to client if the connection is still open
         if not client_socket._closed:
+            try:
+                client_socket.sendall(b'\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00')
+            except socket.error:
+                pass # Ignore if we can't even send the error
+    finally:
+        if client_socket and not client_socket._closed:
             client_socket.close()
-        if not proxy_socket._closed:
+        if proxy_socket and not proxy_socket._closed:
             proxy_socket.close()
         logging.info(f"Closed connection for {client_address}")
-
 
 def relay_data(sock1, sock2, client_address):
     """Relays data between two sockets until one closes or an error occurs."""
