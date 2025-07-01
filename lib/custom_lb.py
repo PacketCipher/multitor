@@ -12,6 +12,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 # --- MODIFIED: Shared state for the round-robin strategy ---
 TOP_N_PROXIES = None # The 'N' in "Top-N" round-robin
+CHECK_MODE = None
 # A lock is needed for thread-safe updates and reads of the shared state.
 _shared_state_lock = threading.Lock()
 # Will be a list of the top N (host, port) tuples, sorted by latency.
@@ -21,12 +22,8 @@ _round_robin_index = 0
 # Original list of proxies from arguments remains the same.
 _target_proxies = []
 
-# Gstatic URL for health checks
-TEST_URL = "http://connectivitycheck.gstatic.com/generate_204"
-HEALTH_CHECK_TIMEOUT = 5 # seconds
-MONITORING_INTERVAL = 60 # seconds
-
-def check_proxy_health(proxy_host, proxy_port, num_rounds=10, requests_per_round=10):
+PING_MONITORING_INTERVAL = 60 # seconds
+def check_proxy_ping_health(proxy_host, proxy_port, num_rounds=10, requests_per_round=10):
     """
     Measures proxy performance by running multiple rounds of parallel requests.
 
@@ -43,6 +40,9 @@ def check_proxy_health(proxy_host, proxy_port, num_rounds=10, requests_per_round
     Returns:
         float: The overall average latency in seconds across all requests.
     """
+    TEST_URL = "http://connectivitycheck.gstatic.com/generate_204"
+    HEALTH_CHECK_TIMEOUT = 5 # seconds
+
     total_requests = num_rounds * requests_per_round
     print(
         f"--- Starting Performance Test for {proxy_host}:{proxy_port} ---\n"
@@ -105,11 +105,93 @@ def check_proxy_health(proxy_host, proxy_port, num_rounds=10, requests_per_round
     
     return overall_avg_latency
 
+DOWNLOAD_MONITORING_INTERVAL = 60 * 60 # seconds
+def check_proxy_download_health(proxy_host, proxy_port, num_downloads=5):
+    """
+    Measures the average time it takes to download a test file via a proxy.
+
+    This function performs a series of downloads sequentially. Failed or timed-out
+    downloads are penalized with a duration equal to DOWNLOAD_TIMEOUT.
+
+    Args:
+        proxy_host (str): The proxy server hostname or IP address.
+        proxy_port (int): The proxy server port.
+        num_downloads (int): The number of times to download the file to find an
+                             average time. Defaults to 5.
+
+    Returns:
+        float: The overall average download time in seconds, including penalties
+               for any failed downloads.
+    """
+    DOWNLOAD_URL = "https://proof.ovh.net/files/1Mb.dat"
+    # A reasonable timeout for downloading a 1MB file. This value is also used
+    # as a penalty for failed downloads.
+    DOWNLOAD_TIMEOUT = 30 # in seconds
+
+    print(
+        f"--- Starting Download Time Test for {proxy_host}:{proxy_port} ---\n"
+        f"Configuration: {num_downloads} downloads of a 1MB file."
+    )
+
+    # A single, thread-safe session is more efficient for multiple requests.
+    session = requests.Session()
+    session.proxies = {
+        'http': f'socks5h://{proxy_host}:{proxy_port}',
+        'https': f'socks5h://{proxy_host}:{proxy_port}'
+    }
+
+    all_durations = []
+    total_start_time = time.time()
+
+    # The main loop for each download test
+    for i in range(num_downloads):
+        try:
+            start_time = time.time()
+            # Perform the GET request to download the file
+            response = session.get(DOWNLOAD_URL, timeout=DOWNLOAD_TIMEOUT)
+            end_time = time.time()
+
+            # raise_for_status() will throw an exception for non-2xx status codes
+            response.raise_for_status()
+
+            duration = end_time - start_time
+            all_durations.append(duration)
+            print(f"Download {i + 1}/{num_downloads}: Succeeded in {duration:.2f}s")
+
+        except requests.exceptions.RequestException as e:
+            # Catches timeouts, connection errors, bad status codes, etc.
+            # Assign the penalty time for any failure.
+            all_durations.append(DOWNLOAD_TIMEOUT)
+            print(f"Download {i + 1}/{num_downloads}: FAILED ({type(e).__name__}). Assigning {DOWNLOAD_TIMEOUT}s penalty.")
+
+
+    # --- Final Summary Calculation ---
+    total_duration = time.time() - total_start_time
+    # A download is successful if its duration is less than the timeout penalty
+    success_count = sum(1 for d in all_durations if d < DOWNLOAD_TIMEOUT)
+    success_rate = (success_count / num_downloads) * 100
+    overall_avg_time = sum(all_durations) / len(all_durations)
+
+
+    print("\n--- Download Time Test Summary ---")
+    print(f"Total downloads attempted: {num_downloads}")
+    print(f"Successful downloads:    {success_count} ({success_rate:.1f}%)")
+    print(f"Total time taken:        {total_duration:.2f} seconds")
+    print(f"Average download time:   {overall_avg_time:.2f}s (includes penalties for failures)")
+    print("--------------------------------")
+
+    return overall_avg_time
 
 def monitor_proxies():
     """
     MODIFIED: Periodically checks all target proxies and updates the list of top N fastest ones.
     """
+    if CHECK_MODE == 0:
+        check_func = check_proxy_ping_health
+        MONITORING_INTERVAL = PING_MONITORING_INTERVAL
+    elif CHECK_MODE == 1:
+        check_func = check_proxy_download_health
+        MONITORING_INTERVAL = DOWNLOAD_MONITORING_INTERVAL
     global _top_proxies
     while True:
         if not _target_proxies:
@@ -122,7 +204,7 @@ def monitor_proxies():
         # 1. Check all proxies and collect their latencies
         healthy_proxies_with_latency = []
         for host, port in _target_proxies:
-            latency = check_proxy_health(host, port)
+            latency = check_func(host, port)
             if latency != float('inf'):
                 # Store as (latency, (host, port)) for easy sorting
                 healthy_proxies_with_latency.append((latency, (host, port)))
@@ -355,7 +437,9 @@ if __name__ == "__main__":
     parser.add_argument("--tor-proxies", type=str, required=True,
                         help="Comma-separated list of Tor SOCKS5 proxies (e.g., 127.0.0.1:9050,127.0.0.1:9051)")
     parser.add_argument("--top-n-proxies", type=int, required=True,
-                        help="Comma-separated list of Tor SOCKS5 proxies (e.g., 127.0.0.1:9050,127.0.0.1:9051)")
+                        help="Roundrobin Top N Proxies")
+    parser.add_argument("--check-mode", type=int, required=True,
+                        help="0 = Ping Check, 1 = Download Check")
 
     args = parser.parse_args()
 
@@ -377,6 +461,7 @@ if __name__ == "__main__":
 
     # TOP_N_PROXIES = len(args.tor_proxies.split(',')) // 3
     TOP_N_PROXIES = args.top_n_proxies
+    CHECK_MODE = args.check_mode
 
     monitor_thread = threading.Thread(target=monitor_proxies)
     monitor_thread.daemon = True

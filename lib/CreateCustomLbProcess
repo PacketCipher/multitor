@@ -25,6 +25,7 @@ function CreateCustomLbProcess() {
   local _lb_listen_host="0.0.0.0"
   local _lb_listen_port="16378"
   local _lb_top_n_proxies="$LB_Top_N_Proxies"
+  local _lb_check_mode="$LB_Check_Mode"
 
   # Construct the comma-separated list of Tor SOCKS proxies
   # _proxy_ports is expected to be a global array populated in src/__init__
@@ -76,7 +77,8 @@ function CreateCustomLbProcess() {
     --listen-host "$_lb_listen_host" \
     --listen-port "$_lb_listen_port" \
     --tor-proxies "$_tor_proxies_list" \
-    --top-n-proxies "$_lb_top_n_proxies" >> "$_log_stdout" 2>&1 &
+    --top-n-proxies "$_lb_top_n_proxies" \
+    --check-mode "$_lb_check_mode" >> "$_log_stdout" 2>&1 &
 
   local _py_pid=$!
 
