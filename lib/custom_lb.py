@@ -24,7 +24,7 @@ _target_proxies = []
 # Gstatic URL for health checks
 TEST_URL = "http://connectivitycheck.gstatic.com/generate_204"
 HEALTH_CHECK_TIMEOUT = 5 # seconds
-MONITORING_INTERVAL = 5 * 60 # seconds
+MONITORING_INTERVAL = 60 # seconds
 
 def check_proxy_health(proxy_host, proxy_port, num_rounds=10, requests_per_round=10):
     """
