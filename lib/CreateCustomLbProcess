@@ -22,8 +22,7 @@ function CreateCustomLbProcess() {
   local _STATE=0
 
   # Define listening parameters for the custom load balancer
-  local _lb_listen_host="127.0.0.1"
-  # Using a different port than HAProxy's default 16379
+  local _lb_listen_host="0.0.0.0"
   local _lb_listen_port="16378"
 
   # Construct the comma-separated list of Tor SOCKS proxies
