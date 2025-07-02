@@ -528,8 +528,8 @@ if __name__ == "__main__":
         exit(1)
 
     # It's good practice to wait a bit for Tor instances to bootstrap
-    logging.info("Waiting 10 seconds for Tor instances to initialize...")
-    time.sleep(10)
+    logging.info("Waiting 10 minutes for Tor instances to initialize...")
+    time.sleep(10 * 60)
 
     TOP_N_PROXIES = args.top_n_proxies
     CHECK_MODE = args.check_mode
