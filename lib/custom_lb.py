@@ -249,7 +249,7 @@ def _run_proxy_check_cycle(check_func):
         else: # new_top_proxies is empty and _top_proxies was also empty
             logging.info("Still no healthy proxies found.")
 
-def monitor_proxies(control_password=None):
+def monitor_proxies(control_password):
     """
     MODIFIED: Periodically checks all target proxies. This check is now triggered
     by either a fixed timer or a real-time Tor circuit status event.
@@ -275,7 +275,7 @@ def monitor_proxies(control_password=None):
                 controller.add_event_listener(circuit_event_handler, Signal.CIRC)
                 logging.info(f"Successfully connected to Tor control port {host}:{control_port} for event monitoring.")
                 controllers.append(controller)
-            except (stem.SocketError, stem.InvalidPassword, stem.AuthenticationFailure, Exception) as e:
+            except (stem.SocketError, stem.connection.IncorrectPassword, stem.connection.AuthenticationFailure, Exception) as e:
                 logging.warning(f"Failed to connect/auth with Tor control port {host}:{control_port}: {e}. Event monitoring disabled for this instance.")
 
     # --- Main Monitoring Loop ---
