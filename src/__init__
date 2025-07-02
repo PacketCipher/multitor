@@ -557,7 +557,7 @@ function __main__() {
     _pass_gen=$(< /dev/urandom tr -dc 'a-zA-Z0-9' | fold -w 18 | head -n 1)
     # shellcheck disable=SC2034
     _pass_hash=$(sudo -u "$user_name" tor --hash-password "$_pass_gen" 2>&1 | grep "^16:")
-    
+
     if [[ "$proxy_state" -eq 1 ]] ; then
 
       # shellcheck disable=SC2034,SC2154
@@ -1125,74 +1125,74 @@ function __main__() {
 
   # Health monitoring loop
   # Only run if instances were initialized in this script execution
-  if [[ "$init_state" -eq 1 ]] && [[ "${#_running_tor_configs[@]}" -gt 0 ]]; then
-    _logger "info" \
-      "${_FUNCTION_ID}()" \
-      "Starting Tor instance health monitoring loop."
+  # if [[ "$init_state" -eq 1 ]] && [[ "${#_running_tor_configs[@]}" -gt 0 ]]; then
+  #   _logger "info" \
+  #     "${_FUNCTION_ID}()" \
+  #     "Starting Tor instance health monitoring loop."
 
-    while true; do
-      _logger "info" \
-        "${_FUNCTION_ID}()" \
-        "Performing health check for ${#_running_tor_configs[@]} Tor instances."
+  #   while true; do
+  #     _logger "info" \
+  #       "${_FUNCTION_ID}()" \
+  #       "Performing health check for ${#_running_tor_configs[@]} Tor instances."
 
-      local _current_instance_index=0 # Keep track of instance index if needed, though not strictly used in current loop logic
-      for config_str in "${_running_tor_configs[@]}"; do
-        # Read the config string into an array
-        local config_array
-        IFS=' ' read -r -a config_array <<< "$config_str"
+  #     local _current_instance_index=0 # Keep track of instance index if needed, though not strictly used in current loop logic
+  #     for config_str in "${_running_tor_configs[@]}"; do
+  #       # Read the config string into an array
+  #       local config_array
+  #       IFS=' ' read -r -a config_array <<< "$config_str"
 
-        local _cfg_uname="${config_array[0]}"
-        local _cfg_socks_port="${config_array[1]}"
-        local _cfg_control_port="${config_array[2]}"
+  #       local _cfg_uname="${config_array[0]}"
+  #       local _cfg_socks_port="${config_array[1]}"
+  #       local _cfg_control_port="${config_array[2]}"
 
-        _logger "info" \
-          "${_FUNCTION_ID}()" \
-          "Checking health of Tor instance: User=${_cfg_uname}, SOCKS Port=${_cfg_socks_port}, Control Port=${_cfg_control_port}"
+  #       _logger "info" \
+  #         "${_FUNCTION_ID}()" \
+  #         "Checking health of Tor instance: User=${_cfg_uname}, SOCKS Port=${_cfg_socks_port}, Control Port=${_cfg_control_port}"
 
-        # check_tor_instance_health returns 0 for healthy, 1 for unhealthy
-        if ! check_tor_instance_health "${_cfg_socks_port}"; then
-          _logger "warn" \
-            "${_FUNCTION_ID}()" \
-            "Tor instance on SOCKS port ${_cfg_socks_port} is unhealthy. Attempting restart."
+  #       # check_tor_instance_health returns 0 for healthy, 1 for unhealthy
+  #       if ! check_tor_instance_health "${_cfg_socks_port}"; then
+  #         _logger "warn" \
+  #           "${_FUNCTION_ID}()" \
+  #           "Tor instance on SOCKS port ${_cfg_socks_port} is unhealthy. Attempting restart."
 
-          # Before restarting, we need to ensure _pass_hash is available if CreateTorProcess needs it.
-          # _pass_hash is set globally if init_state is 1.
-          # If it's not set, CreateTorProcess might fail. This implies the monitoring loop
-          # should only realistically run if the main script initialized the Tor instances.
-          # The restart_tor_instance function calls CreateTorProcess which uses the global _pass_hash
+  #         # Before restarting, we need to ensure _pass_hash is available if CreateTorProcess needs it.
+  #         # _pass_hash is set globally if init_state is 1.
+  #         # If it's not set, CreateTorProcess might fail. This implies the monitoring loop
+  #         # should only realistically run if the main script initialized the Tor instances.
+  #         # The restart_tor_instance function calls CreateTorProcess which uses the global _pass_hash
 
-          restart_tor_instance "${_cfg_uname}" "${_cfg_socks_port}" "${_cfg_control_port}"
-          local _restart_status=$?
+  #         restart_tor_instance "${_cfg_uname}" "${_cfg_socks_port}" "${_cfg_control_port}"
+  #         local _restart_status=$?
 
-          if [[ $_restart_status -eq 0 ]]; then
-            _logger "info" \
-              "${_FUNCTION_ID}()" \
-              "Successfully submitted restart for Tor instance on SOCKS port ${_cfg_socks_port}."
-            # Note: restart_tor_instance itself calls CreateTorProcess, which might have its own logging.
-            # The _running_tor_configs array remains valid as the restarted instance uses the same config.
-          else
-            _logger "error" \
-              "${_FUNCTION_ID}()" \
-              "Failed to restart Tor instance on SOCKS port ${_cfg_socks_port}."
-          fi
-        else
-          _logger "info" \
-            "${_FUNCTION_ID}()" \
-            "Tor instance on SOCKS port ${_cfg_socks_port} is healthy."
-        fi
-        _current_instance_index=$((_current_instance_index + 1))
-      done
+  #         if [[ $_restart_status -eq 0 ]]; then
+  #           _logger "info" \
+  #             "${_FUNCTION_ID}()" \
+  #             "Successfully submitted restart for Tor instance on SOCKS port ${_cfg_socks_port}."
+  #           # Note: restart_tor_instance itself calls CreateTorProcess, which might have its own logging.
+  #           # The _running_tor_configs array remains valid as the restarted instance uses the same config.
+  #         else
+  #           _logger "error" \
+  #             "${_FUNCTION_ID}()" \
+  #             "Failed to restart Tor instance on SOCKS port ${_cfg_socks_port}."
+  #         fi
+  #       else
+  #         _logger "info" \
+  #           "${_FUNCTION_ID}()" \
+  #           "Tor instance on SOCKS port ${_cfg_socks_port} is healthy."
+  #       fi
+  #       _current_instance_index=$((_current_instance_index + 1))
+  #     done
 
-      _logger "info" \
-        "${_FUNCTION_ID}()" \
-        "Health check cycle complete. Waiting for 300 seconds."
-      sleep 300
-    done
-  elif [[ "$init_state" -eq 1 ]] && [[ "${#_running_tor_configs[@]}" -eq 0 ]]; then
-    _logger "warn" \
-      "${_FUNCTION_ID}()" \
-      "Instances were meant to be initialized, but no successful Tor configurations were stored. Monitoring loop will not start."
-  fi
+  #     _logger "info" \
+  #       "${_FUNCTION_ID}()" \
+  #       "Health check cycle complete. Waiting for 300 seconds."
+  #     sleep 300
+  #   done
+  # elif [[ "$init_state" -eq 1 ]] && [[ "${#_running_tor_configs[@]}" -eq 0 ]]; then
+  #   _logger "warn" \
+  #     "${_FUNCTION_ID}()" \
+  #     "Instances were meant to be initialized, but no successful Tor configurations were stored. Monitoring loop will not start."
+  # fi
 
   if [[ "$time_tracking" == "true" ]] ; then
 

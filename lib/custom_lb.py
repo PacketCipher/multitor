@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 import stem
 import stem.control
 from stem import CircStatus, Signal
+from stem.control import EventType
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s')
@@ -27,7 +28,6 @@ _target_proxies = []
 
 # --- NEW: Event to trigger monitoring ---
 _monitor_trigger = threading.Event()
-
 
 PING_MONITORING_INTERVAL = 60 # seconds
 def check_proxy_ping_health(proxy_host, proxy_port, num_rounds=10, requests_per_round=10):
@@ -249,6 +249,7 @@ def _run_proxy_check_cycle(check_func):
         else: # new_top_proxies is empty and _top_proxies was also empty
             logging.info("Still no healthy proxies found.")
 
+## TODO: Only Update Of That Proxy Server That Requires Update
 def monitor_proxies(control_password):
     """
     MODIFIED: Periodically checks all target proxies. This check is now triggered
@@ -272,7 +273,7 @@ def monitor_proxies(control_password):
             try:
                 controller = stem.control.Controller.from_port(address=host, port=control_port)
                 controller.authenticate(password=control_password) # Stem handles None password correctly (tries cookie)
-                controller.add_event_listener(circuit_event_handler, Signal.CIRC)
+                controller.add_event_listener(circuit_event_handler, EventType.CIRC)
                 logging.info(f"Successfully connected to Tor control port {host}:{control_port} for event monitoring.")
                 controllers.append(controller)
             except (stem.SocketError, stem.connection.IncorrectPassword, stem.connection.AuthenticationFailure, Exception) as e:
