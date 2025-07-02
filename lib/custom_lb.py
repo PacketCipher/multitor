@@ -44,7 +44,7 @@ def check_proxy_ping_health(proxy_host, proxy_port, num_rounds=10, requests_per_
     HEALTH_CHECK_TIMEOUT = 5 # seconds
 
     total_requests = num_rounds * requests_per_round
-    print(
+    logging.info(
         f"--- Starting Performance Test for {proxy_host}:{proxy_port} ---\n"
         f"Configuration: {num_rounds} rounds, {requests_per_round} parallel requests per round "
         f"({total_requests} total requests)."
@@ -87,7 +87,7 @@ def check_proxy_ping_health(proxy_host, proxy_port, num_rounds=10, requests_per_
         round_duration = time.time() - round_start_time
         round_avg_latency = sum(round_latencies) / len(round_latencies)
 
-        print(f"Round {i + 1}/{num_rounds} completed in {round_duration:.2f}s. "
+        logging.info(f"Round {i + 1}/{num_rounds} completed in {round_duration:.2f}s. "
               f"Avg latency for this round: {round_avg_latency:.4f}s")
 
     # --- Final Summary Calculation ---
@@ -96,12 +96,12 @@ def check_proxy_ping_health(proxy_host, proxy_port, num_rounds=10, requests_per_
     success_count = sum(1 for lat in all_latencies if lat < HEALTH_CHECK_TIMEOUT)
     success_rate = (success_count / total_requests) * 100
 
-    print("\n--- Performance Test Summary ---")
-    print(f"Total requests made: {total_requests}")
-    print(f"Successful requests: {success_count} ({success_rate:.1f}%)")
-    print(f"Total time taken:    {total_duration:.4f} seconds")
-    print(f"Overall avg latency: {overall_avg_latency:.4f}s (includes penalties for failures)")
-    print("---------------------------------")
+    logging.info("\n--- Performance Test Summary ---")
+    logging.info(f"Total requests made: {total_requests}")
+    logging.info(f"Successful requests: {success_count} ({success_rate:.1f}%)")
+    logging.info(f"Total time taken:    {total_duration:.4f} seconds")
+    logging.info(f"Overall avg latency: {overall_avg_latency:.4f}s (includes penalties for failures)")
+    logging.info("---------------------------------")
     
     return overall_avg_latency
 
@@ -128,7 +128,7 @@ def check_proxy_download_health(proxy_host, proxy_port, num_downloads=1):
     # as a penalty for failed downloads.
     DOWNLOAD_TIMEOUT = 30 # in seconds
 
-    print(
+    logging.info(
         f"--- Starting Download Time Test for {proxy_host}:{proxy_port} ---\n"
         f"Configuration: {num_downloads} downloads of a 1MB file."
     )
@@ -156,13 +156,13 @@ def check_proxy_download_health(proxy_host, proxy_port, num_downloads=1):
 
             duration = end_time - start_time
             all_durations.append(duration)
-            print(f"Download {i + 1}/{num_downloads}: Succeeded in {duration:.2f}s")
+            logging.info(f"Download {i + 1}/{num_downloads}: Succeeded in {duration:.2f}s")
 
         except requests.exceptions.RequestException as e:
             # Catches timeouts, connection errors, bad status codes, etc.
             # Assign the penalty time for any failure.
             all_durations.append(DOWNLOAD_TIMEOUT)
-            print(f"Download {i + 1}/{num_downloads}: FAILED ({type(e).__name__}). Assigning {DOWNLOAD_TIMEOUT}s penalty.")
+            logging.info(f"Download {i + 1}/{num_downloads}: FAILED ({type(e).__name__}). Assigning {DOWNLOAD_TIMEOUT}s penalty.")
 
 
     # --- Final Summary Calculation ---
@@ -173,12 +173,12 @@ def check_proxy_download_health(proxy_host, proxy_port, num_downloads=1):
     overall_avg_time = sum(all_durations) / len(all_durations)
 
 
-    print("\n--- Download Time Test Summary ---")
-    print(f"Total downloads attempted: {num_downloads}")
-    print(f"Successful downloads:    {success_count} ({success_rate:.1f}%)")
-    print(f"Total time taken:        {total_duration:.2f} seconds")
-    print(f"Average download time:   {overall_avg_time:.2f}s (includes penalties for failures)")
-    print("--------------------------------")
+    logging.info("\n--- Download Time Test Summary ---")
+    logging.info(f"Total downloads attempted: {num_downloads}")
+    logging.info(f"Successful downloads:    {success_count} ({success_rate:.1f}%)")
+    logging.info(f"Total time taken:        {total_duration:.2f} seconds")
+    logging.info(f"Average download time:   {overall_avg_time:.2f}s (includes penalties for failures)")
+    logging.info("--------------------------------")
 
     return overall_avg_time
 
@@ -210,7 +210,7 @@ def monitor_proxies():
                     # Store as (latency, (host, port)) for easy sorting
                     healthy_proxies_with_latency.append((latency, (host, port)))
             except Exception as e:
-                print(e)
+                logging.info(e)
                 continue
 
         # 2. Sort by latency (lowest first)
