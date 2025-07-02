@@ -201,7 +201,8 @@ def circuit_event_handler(event):
     NEW: Callback for stem's CIRC events. Sets the global trigger event.
     """
     # We only care about events that signify a real change in path availability.
-    if event.status in [CircStatus.BUILT, CircStatus.FAILED, CircStatus.CLOSED]:
+    # if event.status in [CircStatus.BUILT, CircStatus.FAILED, CircStatus.CLOSED]:
+    if event.status in [CircStatus.BUILT, CircStatus.CLOSED]:
         logging.info(f"Tor circuit event ({event.status}) received. Triggering proxy health re-check.")
         _monitor_trigger.set()
 
@@ -528,7 +529,7 @@ if __name__ == "__main__":
 
     # It's good practice to wait a bit for Tor instances to bootstrap
     logging.info("Waiting 10 seconds for Tor instances to initialize...")
-    time.sleep(10 * 60)
+    time.sleep(10)
 
     TOP_N_PROXIES = args.top_n_proxies
     CHECK_MODE = args.check_mode
