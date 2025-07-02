@@ -10,6 +10,7 @@ import stem
 import stem.control
 from stem import CircStatus, Signal
 from stem.control import EventType
+import queue # NEW: Import the queue module
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s')
@@ -26,8 +27,9 @@ _round_robin_index = 0
 # Original list of proxies from arguments remains the same.
 _target_proxies = []
 
-# --- NEW: Event to trigger monitoring ---
-_monitor_trigger = threading.Event()
+# --- NEW: Queue to trigger targeted monitoring ---
+# This queue will hold (host, port) tuples of proxies that need an update.
+_update_queue = queue.Queue()
 
 PING_MONITORING_INTERVAL = 60 # seconds
 def check_proxy_ping_health(proxy_host, proxy_port, num_rounds=10, requests_per_round=10):
@@ -190,54 +192,39 @@ def check_proxy_download_health(proxy_host, proxy_port, num_downloads=1):
     return overall_avg_time
 
 def get_control_port(socks_port):
-    """
-    NEW: Derives the Tor control port from a SOCKS port.
-    Assumes SOCKS port 90xx maps to control port 99xx (e.g., 9050 -> 9950).
-    """
+    """Derives the Tor control port from a SOCKS port."""
     return int(socks_port) + 900
 
-def circuit_event_handler(event):
+def create_circuit_event_handler(proxy_tuple):
     """
-    NEW: Callback for stem's CIRC events. Sets the global trigger event.
+    NEW: Factory function that creates a targeted event handler.
+    This allows the handler to know which proxy instance it's for.
     """
-    # We only care about events that signify a real change in path availability.
-    # if event.status in [CircStatus.BUILT, CircStatus.FAILED, CircStatus.CLOSED]:
-    if event.status in [CircStatus.BUILT, CircStatus.CLOSED]:
-        logging.info(f"Tor circuit event ({event.status}) received. Triggering proxy health re-check.")
-        _monitor_trigger.set()
+    host, port = proxy_tuple
+    def handler(event):
+        # We only care about events that signify a real change in path availability.
+        if event.status in [CircStatus.BUILT, CircStatus.CLOSED]:
+            logging.info(f"Tor circuit event ({event.status}) for proxy {host}:{port}. "
+                         f"Queueing for a targeted health re-check.")
+            # Put the specific proxy that had the event into the queue.
+            _update_queue.put(proxy_tuple)
+    return handler
 
-def _run_proxy_check_cycle(check_func):
+def _update_top_proxies_list(health_data):
     """
-    NEW: The core logic of one monitoring pass, extracted for reuse.
+    NEW HELPER: Takes a dictionary of health data, sorts it, and updates
+    the global _top_proxies list in a thread-safe way.
     """
     global _top_proxies
-    if not _target_proxies:
-        logging.warning("Monitor: No target proxies configured.")
-        with _shared_state_lock:
-            _top_proxies = [] # Clear top proxies if none are configured
-        return
+    # health_data is a dict: {(host, port): latency}
+    # Sort by latency (the value of the dict item)
+    sorted_proxies_with_latency = sorted(health_data.items(), key=lambda item: item[1])
 
-    # 1. Check all proxies and collect their latencies
-    healthy_proxies_with_latency = []
-    for host, port in _target_proxies:
-        try:
-            latency = check_func(host, port)
-            # Store as (latency, (host, port)) for easy sorting
-            healthy_proxies_with_latency.append((latency, (host, port)))
-        except Exception as e:
-            logging.error(f"Error checking proxy {host}:{port}: {e}", exc_info=False)
-            continue
+    # Get the new list of top N proxies (without latency info)
+    new_top_proxies = [proxy for proxy, latency in sorted_proxies_with_latency[:TOP_N_PROXIES]]
 
-    # 2. Sort by latency (lowest first)
-    healthy_proxies_with_latency.sort(key=lambda x: x[0])
-
-    # 3. Get the new list of top N proxies (without latency info)
-    sorted_proxies = [proxy for latency, proxy in healthy_proxies_with_latency]
-    new_top_proxies = sorted_proxies[:TOP_N_PROXIES]
-
-    # 4. Atomically update the shared list
+    # Atomically update the shared list
     with _shared_state_lock:
-        # Check if the list has actually changed to avoid noisy logs
         if _top_proxies != new_top_proxies:
             logging.info(f"Updating top proxies list. New list: {new_top_proxies}")
             _top_proxies = new_top_proxies
@@ -245,15 +232,15 @@ def _run_proxy_check_cycle(check_func):
              logging.warning("No healthy proxies found. Clearing top proxies list.")
              _top_proxies = []
         elif new_top_proxies:
-            logging.info(f"Top proxies list remains unchanged: {new_top_proxies}")
+            logging.info(f"Top proxies list remains unchanged after update: {_top_proxies}")
         else: # new_top_proxies is empty and _top_proxies was also empty
             logging.info("Still no healthy proxies found.")
 
-## TODO: Only Update Of That Proxy Server That Requires Update
 def monitor_proxies(control_password):
     """
-    MODIFIED: Periodically checks all target proxies. This check is now triggered
-    by either a fixed timer or a real-time Tor circuit status event.
+    MODIFIED: Periodically and on-demand checks proxy health.
+    - Runs a full check on all proxies periodically.
+    - Runs a targeted check on a single proxy when triggered by a Tor event.
     """
     if CHECK_MODE == 0:
         check_func = check_proxy_ping_health
@@ -265,35 +252,80 @@ def monitor_proxies(control_password):
         logging.error(f"Invalid CHECK_MODE '{CHECK_MODE}'. Monitor thread exiting.")
         return
 
-    # --- Setup Stem Controllers for Event Monitoring ---
+    # --- Local state for the monitor thread ---
+    # This dictionary will store the last known health metric for each proxy.
+    # e.g., {(host, port): latency, (host2, port2): latency2}
+    proxy_health_data = {}
+
+    def _run_full_check_cycle():
+        """NEW HELPER: Checks all target proxies and updates health data."""
+        logging.info("--- Running full periodic health check on all target proxies... ---")
+        if not _target_proxies:
+            logging.warning("Monitor: No target proxies configured.")
+            proxy_health_data.clear()
+        else:
+            for host, port in _target_proxies:
+                try:
+                    latency = check_func(host, port)
+                    proxy_health_data[(host, port)] = latency
+                except Exception as e:
+                    logging.error(f"Error checking proxy {host}:{port}: {e}", exc_info=False)
+                    # Optionally remove from health data if it fails completely
+                    if (host, port) in proxy_health_data:
+                        del proxy_health_data[(host, port)]
+                    continue
+        # After the full check, update the global top proxies list
+        _update_top_proxies_list(proxy_health_data)
+        logging.info("--- Full periodic health check cycle complete. ---")
+
+
+    # 1. Run an initial full check to populate the list for the first time.
+    _run_full_check_cycle()
+
+    # 2. Setup Stem Controllers for Event Monitoring
     controllers = []
     for host, port in _target_proxies:
         control_port = get_control_port(port)
         if control_port:
             try:
                 controller = stem.control.Controller.from_port(address=host, port=control_port)
-                controller.authenticate(password=control_password) # Stem handles None password correctly (tries cookie)
-                controller.add_event_listener(circuit_event_handler, EventType.CIRC)
+                controller.authenticate(password=control_password)
+                # Create a specific handler for this proxy
+                handler = create_circuit_event_handler((host, port))
+                controller.add_event_listener(handler, EventType.CIRC)
                 logging.info(f"Successfully connected to Tor control port {host}:{control_port} for event monitoring.")
                 controllers.append(controller)
-            except (stem.SocketError, stem.connection.IncorrectPassword, stem.connection.AuthenticationFailure, Exception) as e:
+            except Exception as e:
                 logging.warning(f"Failed to connect/auth with Tor control port {host}:{control_port}: {e}. Event monitoring disabled for this instance.")
 
-    # --- Main Monitoring Loop ---
+    # 3. Main Monitoring Loop
     while True:
-        # 1. Run the health check logic
-        _run_proxy_check_cycle(check_func)
+        try:
+            # Block and wait for a proxy tuple from the queue.
+            # Has a timeout, so this serves as our periodic timer as well.
+            # proxy_to_update = _update_queue.get(timeout=MONITORING_INTERVAL)
+            proxy_to_update = _update_queue.get()
 
-        # 2. Wait for the next trigger (either event or timeout)
-        logging.info(f"Health check cycle complete. Waiting for next trigger (timeout: {MONITORING_INTERVAL}s or circuit event)...")
-        # disable fallback timer
-        # triggered_by_event = _monitor_trigger.wait(timeout=MONITORING_INTERVAL)
-        triggered_by_event = _monitor_trigger.wait()
+            # --- If we get here, it was an EVENT-DRIVEN update ---
+            logging.info(f"--- Running event-driven health check for {proxy_to_update[0]}:{proxy_to_update[1]} ---")
+            try:
+                host, port = proxy_to_update
+                latency = check_func(host, port)
+                proxy_health_data[(host, port)] = latency
+            except Exception as e:
+                 logging.error(f"Error during event-driven check of {proxy_to_update[0]}:{proxy_to_update[1]}: {e}")
+                 # If it fails, remove it from the health data so it's not considered
+                 if proxy_to_update in proxy_health_data:
+                     del proxy_health_data[proxy_to_update]
 
-        if triggered_by_event:
-            # Woken up by circuit_event_handler calling _monitor_trigger.set()
-            _monitor_trigger.clear()  # Reset the trigger for the next wait cycle
-        # If woken up by timeout, the loop continues naturally.
+            # After the single update, recalculate the global top proxies list
+            _update_top_proxies_list(proxy_health_data)
+            logging.info(f"--- Event-driven health check for {proxy_to_update[0]}:{proxy_to_update[1]} complete. ---")
+
+        except queue.Empty:
+            # --- If we get here, the timeout was reached (PERIODIC update) ---
+            # No item was in the queue, so we run the full check on all proxies.
+            _run_full_check_cycle()
 
     # Cleanup (in case the loop is ever broken)
     for controller in controllers:
@@ -302,11 +334,9 @@ def monitor_proxies(control_password):
         except:
             pass
 
+
 def select_proxy_round_robin():
-    """
-    NEW: Selects a proxy from the top N list using a round-robin strategy.
-    This is thread-safe.
-    """
+    """Selects a proxy from the top N list using a round-robin strategy."""
     global _round_robin_index
     with _shared_state_lock:
         if not _top_proxies:
@@ -328,7 +358,7 @@ def handle_client_connection(client_socket, client_address):
     proxy_socket = None # Ensure proxy_socket is defined for the finally block
 
     try:
-        # --- MODIFIED: Use the new round-robin selection function ---
+        # --- Use the round-robin selection function ---
         upstream_proxy = select_proxy_round_robin()
         if not upstream_proxy:
             logging.error(f"No healthy upstream SOCKS proxy available for {client_address}. Closing connection.")
@@ -529,13 +559,12 @@ if __name__ == "__main__":
         exit(1)
 
     # It's good practice to wait a bit for Tor instances to bootstrap
-    logging.info("Waiting 10 minutes for Tor instances to initialize...")
-    time.sleep(10 * 60)
+    logging.info("Waiting 1 minute for Tor instances to initialize...")
+    time.sleep(60)
 
     TOP_N_PROXIES = args.top_n_proxies
     CHECK_MODE = args.check_mode
 
-    # --- MODIFIED: Pass control password to the monitor thread ---
     monitor_thread = threading.Thread(target=monitor_proxies, args=(args.tor_control_password,))
     monitor_thread.daemon = True
     monitor_thread.start()
