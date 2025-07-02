@@ -78,7 +78,8 @@ function CreateCustomLbProcess() {
     --listen-port "$_lb_listen_port" \
     --tor-proxies "$_tor_proxies_list" \
     --top-n-proxies "$_lb_top_n_proxies" \
-    --check-mode "$_lb_check_mode" >> "$_log_stdout" 2>&1 &
+    --check-mode "$_lb_check_mode" \
+    --tor-control-password "$_pass_hash" >> "$_log_stdout" 2>&1 &
 
   local _py_pid=$!
 

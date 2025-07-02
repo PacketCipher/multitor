@@ -6,6 +6,9 @@ import logging
 import argparse
 import socks # PySocks
 from concurrent.futures import ThreadPoolExecutor
+import stem
+import stem.control
+from stem import CircStatus, Signal
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s')
@@ -21,6 +24,10 @@ _top_proxies = []
 _round_robin_index = 0
 # Original list of proxies from arguments remains the same.
 _target_proxies = []
+
+# --- NEW: Event to trigger monitoring ---
+_monitor_trigger = threading.Event()
+
 
 PING_MONITORING_INTERVAL = 60 # seconds
 def check_proxy_ping_health(proxy_host, proxy_port, num_rounds=10, requests_per_round=10):
@@ -182,9 +189,69 @@ def check_proxy_download_health(proxy_host, proxy_port, num_downloads=1):
 
     return overall_avg_time
 
-def monitor_proxies():
+def get_control_port(socks_port):
     """
-    MODIFIED: Periodically checks all target proxies and updates the list of top N fastest ones.
+    NEW: Derives the Tor control port from a SOCKS port.
+    Assumes SOCKS port 90xx maps to control port 99xx (e.g., 9050 -> 9950).
+    """
+    return int(socks_port) + 900
+
+def circuit_event_handler(event):
+    """
+    NEW: Callback for stem's CIRC events. Sets the global trigger event.
+    """
+    # We only care about events that signify a real change in path availability.
+    if event.status in [CircStatus.BUILT, CircStatus.FAILED, CircStatus.CLOSED]:
+        logging.info(f"Tor circuit event ({event.status}) received. Triggering proxy health re-check.")
+        _monitor_trigger.set()
+
+def _run_proxy_check_cycle(check_func):
+    """
+    NEW: The core logic of one monitoring pass, extracted for reuse.
+    """
+    global _top_proxies
+    if not _target_proxies:
+        logging.warning("Monitor: No target proxies configured.")
+        with _shared_state_lock:
+            _top_proxies = [] # Clear top proxies if none are configured
+        return
+
+    # 1. Check all proxies and collect their latencies
+    healthy_proxies_with_latency = []
+    for host, port in _target_proxies:
+        try:
+            latency = check_func(host, port)
+            # Store as (latency, (host, port)) for easy sorting
+            healthy_proxies_with_latency.append((latency, (host, port)))
+        except Exception as e:
+            logging.error(f"Error checking proxy {host}:{port}: {e}", exc_info=False)
+            continue
+
+    # 2. Sort by latency (lowest first)
+    healthy_proxies_with_latency.sort(key=lambda x: x[0])
+
+    # 3. Get the new list of top N proxies (without latency info)
+    sorted_proxies = [proxy for latency, proxy in healthy_proxies_with_latency]
+    new_top_proxies = sorted_proxies[:TOP_N_PROXIES]
+
+    # 4. Atomically update the shared list
+    with _shared_state_lock:
+        # Check if the list has actually changed to avoid noisy logs
+        if _top_proxies != new_top_proxies:
+            logging.info(f"Updating top proxies list. New list: {new_top_proxies}")
+            _top_proxies = new_top_proxies
+        elif not new_top_proxies and _top_proxies:
+             logging.warning("No healthy proxies found. Clearing top proxies list.")
+             _top_proxies = []
+        elif new_top_proxies:
+            logging.info(f"Top proxies list remains unchanged: {new_top_proxies}")
+        else: # new_top_proxies is empty and _top_proxies was also empty
+            logging.info("Still no healthy proxies found.")
+
+def monitor_proxies(control_password=None):
+    """
+    MODIFIED: Periodically checks all target proxies. This check is now triggered
+    by either a fixed timer or a real-time Tor circuit status event.
     """
     if CHECK_MODE == 0:
         check_func = check_proxy_ping_health
@@ -192,49 +259,46 @@ def monitor_proxies():
     elif CHECK_MODE == 1:
         check_func = check_proxy_download_health
         MONITORING_INTERVAL = DOWNLOAD_MONITORING_INTERVAL
-    global _top_proxies
-    while True:
-        if not _target_proxies:
-            logging.warning("Monitor: No target proxies configured.")
-            with _shared_state_lock:
-                _top_proxies = [] # Clear top proxies if none are configured
-            time.sleep(MONITORING_INTERVAL)
-            continue
+    else:
+        logging.error(f"Invalid CHECK_MODE '{CHECK_MODE}'. Monitor thread exiting.")
+        return
 
-        # 1. Check all proxies and collect their latencies
-        healthy_proxies_with_latency = []
-        for host, port in _target_proxies:
+    # --- Setup Stem Controllers for Event Monitoring ---
+    controllers = []
+    for host, port in _target_proxies:
+        control_port = get_control_port(port)
+        if control_port:
             try:
-                latency = check_func(host, port)
-                if latency != float('inf'):
-                    # Store as (latency, (host, port)) for easy sorting
-                    healthy_proxies_with_latency.append((latency, (host, port)))
-            except Exception as e:
-                logging.info(e)
-                continue
+                controller = stem.control.Controller.from_port(address=host, port=control_port)
+                controller.authenticate(password=control_password) # Stem handles None password correctly (tries cookie)
+                controller.add_event_listener(circuit_event_handler, Signal.CIRC)
+                logging.info(f"Successfully connected to Tor control port {host}:{control_port} for event monitoring.")
+                controllers.append(controller)
+            except (stem.SocketError, stem.InvalidPassword, stem.AuthenticationFailure, Exception) as e:
+                logging.warning(f"Failed to connect/auth with Tor control port {host}:{control_port}: {e}. Event monitoring disabled for this instance.")
 
-        # 2. Sort by latency (lowest first)
-        healthy_proxies_with_latency.sort(key=lambda x: x[0])
+    # --- Main Monitoring Loop ---
+    while True:
+        # 1. Run the health check logic
+        _run_proxy_check_cycle(check_func)
 
-        # 3. Get the new list of top N proxies (without latency info)
-        sorted_proxies = [proxy for latency, proxy in healthy_proxies_with_latency]
-        new_top_proxies = sorted_proxies[:TOP_N_PROXIES]
+        # 2. Wait for the next trigger (either event or timeout)
+        logging.info(f"Health check cycle complete. Waiting for next trigger (timeout: {MONITORING_INTERVAL}s or circuit event)...")
+        # disable fallback timer
+        # triggered_by_event = _monitor_trigger.wait(timeout=MONITORING_INTERVAL)
+        triggered_by_event = _monitor_trigger.wait()
 
-        # 4. Atomically update the shared list
-        with _shared_state_lock:
-            # Check if the list has actually changed to avoid noisy logs
-            if _top_proxies != new_top_proxies:
-                logging.info(f"Updating top proxies list. New list: {new_top_proxies}")
-                _top_proxies = new_top_proxies
-            elif not new_top_proxies and _top_proxies:
-                 logging.warning("No healthy proxies found. Clearing top proxies list.")
-                 _top_proxies = []
-            elif new_top_proxies:
-                logging.info(f"Top proxies list remains unchanged: {new_top_proxies}")
-            else: # new_top_proxies is empty and _top_proxies was also empty
-                logging.info("Still no healthy proxies found.")
+        if triggered_by_event:
+            # Woken up by circuit_event_handler calling _monitor_trigger.set()
+            _monitor_trigger.clear()  # Reset the trigger for the next wait cycle
+        # If woken up by timeout, the loop continues naturally.
 
-        time.sleep(MONITORING_INTERVAL)
+    # Cleanup (in case the loop is ever broken)
+    for controller in controllers:
+        try:
+            controller.close()
+        except:
+            pass
 
 def select_proxy_round_robin():
     """
@@ -435,15 +499,17 @@ def start_server(listen_host, listen_port):
     logging.info("Server stopped.")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Custom SOCKS5 Load Balancer for Tor with Round-Robin.")
+    parser = argparse.ArgumentParser(description="Custom SOCKS5 Load Balancer for Tor with event-driven health checks.")
     parser.add_argument("--listen-host", type=str, required=True, help="Host to listen on (e.g., 127.0.0.1)")
     parser.add_argument("--listen-port", type=int, required=True, help="Port to listen on (e.g., 16378)")
     parser.add_argument("--tor-proxies", type=str, required=True,
                         help="Comma-separated list of Tor SOCKS5 proxies (e.g., 127.0.0.1:9050,127.0.0.1:9051)")
     parser.add_argument("--top-n-proxies", type=int, required=True,
-                        help="Roundrobin Top N Proxies")
+                        help="Round-robin Top N fastest proxies.")
     parser.add_argument("--check-mode", type=int, required=True,
                         help="0 = Ping Check, 1 = Download Check")
+    parser.add_argument("--tor-control-password", type=str, default=None,
+                        help="Password for the Tor control ports. If not set, cookie authentication is attempted.")
 
     args = parser.parse_args()
 
@@ -460,14 +526,15 @@ if __name__ == "__main__":
         logging.error(f"Invalid format for --tor-proxies: {args.tor_proxies}. Error: {e}. Exiting.")
         exit(1)
 
-    # wait a minute for connection
+    # It's good practice to wait a bit for Tor instances to bootstrap
+    logging.info("Waiting 10 seconds for Tor instances to initialize...")
     time.sleep(10 * 60)
 
-    # TOP_N_PROXIES = len(args.tor_proxies.split(',')) // 3
     TOP_N_PROXIES = args.top_n_proxies
     CHECK_MODE = args.check_mode
 
-    monitor_thread = threading.Thread(target=monitor_proxies)
+    # --- MODIFIED: Pass control password to the monitor thread ---
+    monitor_thread = threading.Thread(target=monitor_proxies, args=(args.tor_control_password,))
     monitor_thread.daemon = True
     monitor_thread.start()
 
@@ -477,61 +544,3 @@ if __name__ == "__main__":
         logging.critical(f"Unhandled exception in server: {e}", exc_info=True)
     finally:
         logging.info("Custom LB shutting down.")
-
-# Ensure this file is executable: chmod +x lib/custom_lb.py
-# Example usage:
-# python3 lib/custom_lb.py --listen-host 127.0.0.1 --listen-port 16378 --tor-proxies 127.0.0.1:9050,127.0.0.1:9051,127.0.0.1:9052
-#
-# To test with curl:
-# curl --socks5-hostname 127.0.0.1:16378 http://httpbin.org/ip
-# (Note: --socks5-hostname is important for curl to send hostname, if your SOCKS proxy expects it for name resolution)
-# Or simply:
-# curl --proxy socks5h://127.0.0.1:16378 http://httpbin.org/ip
-# (socks5h does DNS resolution through the proxy)
-
-# Dependencies:
-# pip install requests pysocks
-# or for system:
-# sudo apt-get install python3-requests python3-pysocks (Debian/Ubuntu)
-# sudo yum install python3-requests python3-PySocks (Fedora/CentOS) - check exact package name for PySocks
-#
-# Notes on SOCKS5 implementation:
-# - This is a basic SOCKS5 proxy implementation, focusing on the CONNECT command.
-# - It only supports the "NO AUTHENTICATION REQUIRED" (0x00) method.
-# - Error handling for SOCKS protocol steps is included.
-# - The `socks.create_connection` from PySocks handles the client part of connecting to the upstream Tor SOCKS proxy.
-# - The server part (accepting SOCKS connections from applications) is implemented manually.
-# - `socks5h` in requests/curl means DNS resolution happens via the proxy. This is generally what you want with Tor.
-#
-# Improvements for production:
-# - More robust error handling and recovery in monitoring and client handling.
-# - Potentially use asyncio for higher concurrency if many connections are expected, though threading is fine for moderate loads.
-# - More sophisticated health checks (e.g., multiple URLs, retry mechanisms).
-# - Configuration via a file instead of just command-line args for more complex setups.
-# - Signal handling for graceful shutdown (SIGINT is handled by default Python, SIGTERM might need explicit handling).
-# - Better logging control (e.g., log levels from args).
-# - PID file creation/management if run as a daemon.
-
-# For the specific use case of multitor:
-# - The bash scripts will call this Python script.
-# - The list of Tor SOCKS ports will be dynamically generated by the bash script and passed to --tor-proxies.
-# - stdout/stderr from this script should be captured by multitor's logging.
-# - The listen-host and listen-port will be fixed (e.g., 127.0.0.1 and a new port like 16378).
-# - The health check URL is hardcoded to gstatic's 204, as per requirements.
-# - The 60-second monitoring interval is also per requirements.
-# - The `daemon = True` for threads is important so they don't prevent the script from exiting if the main thread is killed by multitor.
-# - The script is designed to be killed by multitor (e.g., SIGTERM or SIGKILL) when multitor shuts down.
-#   A more graceful shutdown could be implemented if multitor sends SIGTERM and this script catches it.
-#   However, for now, daemon threads + process kill is acceptable for this integration.
-# - The `socks.SOCKS5` constant is from the `socks` module (PySocks).
-# - The `socks.create_connection` is a helper from PySocks that simplifies making an outgoing SOCKS connection.
-#   It handles the SOCKS handshake with the *upstream* Tor proxy.
-# - The code *before* `proxy_socket.sendall(client_req_header + dst_addr_bytes + dst_port_bytes)` is this script acting as a *SOCKS server* to the *client application*.
-# - The code *after* that, involving `proxy_socket.recv` and `proxy_socket.sendall`, is this script acting as a *SOCKS client* to the *upstream Tor proxy*.
-# - The use of `socks5h://` for `requests` is important to ensure DNS resolution also goes through Tor.
-
-# Final check on proxy types for requests:
-# socks5://<user>:<pass>@<host>:<port> - SOCKS5 proxy
-# socks5h://<user>:<pass>@<host>:<port> - SOCKS5 proxy, DNS resolved through proxy
-# For Tor, we want DNS resolution through the proxy, so 'socks5h' is correct.
-# Since Tor by default doesn't use user/pass, it simplifies to 'socks5h://{proxy_host}:{proxy_port}'
