@@ -10,14 +10,45 @@ import stem
 import stem.control
 from stem import CircStatus, Signal
 from stem.control import EventType
-# queue is no longer needed for the core logic.
+import queue
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s')
 
-# --- REMOVED: DedupeQueue class is no longer needed ---
+# --- NEW CLASS: A thread-safe queue that prevents duplicate items ---
+class DedupeQueue(queue.Queue):
+    """
+    A custom queue class that inherits from queue.Queue but adds deduplication.
 
-# --- MODIFIED: Shared state and trigger mechanism ---
+    It ensures that an item cannot be added to the queue if it is already
+    present. This is crucial for the event-driven monitoring to prevent a
+    flurry of events for a single proxy from causing multiple redundant
+    health checks.
+
+    It uses an internal set for O(1) average time complexity for checking
+    item existence, and a lock to ensure that the check-and-add operations
+    are atomic and thread-safe.
+    """
+    def _init(self, maxsize):
+        super()._init(maxsize)
+        # The set to track items currently in the queue for fast lookups.
+        self.items_in_queue = set()
+
+    def _put(self, item):
+        # The core deduplication logic: only put the item if it's not
+        # already in our tracking set.
+        if item not in self.items_in_queue:
+            super()._put(item)
+            self.items_in_queue.add(item)
+
+    def _get(self):
+        # Get the item from the underlying deque.
+        item = super()._get()
+        # Remove the item from our tracking set as it's no longer in the queue.
+        self.items_in_queue.remove(item)
+        return item
+
+# --- MODIFIED: Shared state for the round-robin strategy ---
 TOP_N_PROXIES = None # The 'N' in "Top-N" round-robin
 CHECK_MODE = None
 # A lock is needed for thread-safe updates and reads of the shared state.
@@ -29,10 +60,10 @@ _round_robin_index = 0
 # Original list of proxies from arguments remains the same.
 _target_proxies = []
 
-# --- NEW: Replaces the queue with a simple, thread-safe event trigger ---
-# This event is set by a Tor event handler if a top proxy has an issue.
-# The monitor thread waits on this event.
-_full_recheck_needed_event = threading.Event()
+# --- MODIFIED: Queue to trigger targeted monitoring with deduplication ---
+# This queue will hold (host, port) tuples of proxies that need an update.
+# Using the DedupeQueue prevents redundant checks for the same proxy.
+_update_queue = DedupeQueue()
 
 PING_MONITORING_INTERVAL = 60 # seconds
 def check_proxy_ping_health(proxy_host, proxy_port, num_rounds=10, requests_per_round=10):
@@ -201,31 +232,17 @@ def get_control_port(socks_port):
 def create_circuit_event_handler(proxy_tuple):
     """
     Factory function that creates a targeted event handler.
-
-    The handler checks if the proxy associated with the event is currently
-    in the list of top-performing proxies. If it is, it triggers a global
-    event to signal that a full health re-check of all proxies is needed.
-    Events for proxies not in the top list are ignored.
+    This allows the handler to know which proxy instance it's for.
     """
     host, port = proxy_tuple
     def handler(event):
         # We only care about events that signify a real change in path availability.
         if event.status in [CircStatus.BUILT, CircStatus.CLOSED]:
-            # Thread-safely check if this proxy is currently one of the top performers.
-            with _shared_state_lock:
-                is_top_proxy = proxy_tuple in _top_proxies
-
-            if is_top_proxy:
-                logging.info(
-                    f"Tor circuit event ({event.status}) for a TOP proxy {host}:{port}. "
-                    f"Triggering an immediate full health re-check."
-                )
-                # Set the event to signal the monitor thread to wake up and run a full check.
-                _full_recheck_needed_event.set()
-            else:
-                # This is useful for debugging but can be noisy.
-                logging.debug(f"Ignoring circuit event for non-top proxy {host}:{port}")
-
+            logging.info(f"Tor circuit event ({event.status}) for proxy {host}:{port}. "
+                         f"Queueing for a targeted health re-check.")
+            # Put the specific proxy that had the event into the queue.
+            # The DedupeQueue will automatically prevent duplicates.
+            _update_queue.put(proxy_tuple)
     return handler
 
 def _update_top_proxies_list(health_data):
@@ -257,9 +274,8 @@ def _update_top_proxies_list(health_data):
 def monitor_proxies(control_password):
     """
     Periodically and on-demand checks proxy health.
-    - Runs a full check on all proxies periodically based on MONITORING_INTERVAL.
-    - Runs an immediate full check if a Tor circuit event occurs for a proxy
-      that is currently in the active `_top_proxies` list.
+    - Runs a full check on all proxies periodically.
+    - Runs a targeted check on a single proxy when triggered by a Tor event.
     """
     if CHECK_MODE == 0:
         check_func = check_proxy_ping_health
@@ -271,12 +287,14 @@ def monitor_proxies(control_password):
         logging.error(f"Invalid CHECK_MODE '{CHECK_MODE}'. Monitor thread exiting.")
         return
 
+    # --- Local state for the monitor thread ---
     # This dictionary will store the last known health metric for each proxy.
     # e.g., {(host, port): latency, (host2, port2): latency2}
     proxy_health_data = {}
 
     def _run_full_check_cycle():
-        """Checks all target proxies, updates health data, and updates the global list."""
+        """Checks all target proxies and updates health data."""
+        logging.info("--- Running full periodic health check on all target proxies... ---")
         if not _target_proxies:
             logging.warning("Monitor: No target proxies configured.")
             proxy_health_data.clear()
@@ -293,11 +311,10 @@ def monitor_proxies(control_password):
                     continue
         # After the full check, update the global top proxies list
         _update_top_proxies_list(proxy_health_data)
-        logging.info("--- Full health check cycle complete. ---")
+        logging.info("--- Full periodic health check cycle complete. ---")
 
 
     # 1. Run an initial full check to populate the list for the first time.
-    logging.info("--- Running initial health check on all target proxies... ---")
     _run_full_check_cycle()
 
     # 2. Setup Stem Controllers for Event Monitoring
@@ -318,22 +335,32 @@ def monitor_proxies(control_password):
 
     # 3. Main Monitoring Loop
     while True:
-        # Wait for the event to be set OR for the timeout to expire.
-        # This one line replaces the `queue.get(timeout=...)` and the try/except block.
-        # event_was_set = _full_recheck_needed_event.wait(timeout=MONITORING_INTERVAL)
-        event_was_set = _full_recheck_needed_event.wait()
+        try:
+            # Block and wait for a proxy tuple from the queue.
+            # Has a timeout, so this serves as our periodic timer as well.
+            # proxy_to_update = _update_queue.get(timeout=MONITORING_INTERVAL)
+            proxy_to_update = _update_queue.get()
 
-        if event_was_set:
-            # --- If we get here, it was an EVENT-DRIVEN trigger ---
-            logging.info("--- Received event for a top proxy. Starting event-driven full health check... ---")
-            # Clear the event flag immediately so we don't loop again on the same event.
-            _full_recheck_needed_event.clear()
-        else:
-            # --- If we get here, the wait timed out (PERIODIC update) ---
-            logging.info("--- Monitoring interval reached. Starting periodic full health check... ---")
+            # --- If we get here, it was an EVENT-DRIVEN update ---
+            logging.info(f"--- Running event-driven health check for {proxy_to_update[0]}:{proxy_to_update[1]} ---")
+            try:
+                host, port = proxy_to_update
+                latency = check_func(host, port)
+                proxy_health_data[(host, port)] = latency
+            except Exception as e:
+                 logging.error(f"Error during event-driven check of {proxy_to_update[0]}:{proxy_to_update[1]}: {e}")
+                 # If it fails, remove it from the health data so it's not considered
+                 if proxy_to_update in proxy_health_data:
+                     del proxy_health_data[proxy_to_update]
 
-        # In both cases (event or timeout), we run a full check cycle.
-        _run_full_check_cycle()
+            # After the single update, recalculate the global top proxies list
+            _update_top_proxies_list(proxy_health_data)
+            logging.info(f"--- Event-driven health check for {proxy_to_update[0]}:{proxy_to_update[1]} complete. ---")
+
+        except queue.Empty:
+            # --- If we get here, the timeout was reached (PERIODIC update) ---
+            # No item was in the queue, so we run the full check on all proxies.
+            _run_full_check_cycle()
 
     # Cleanup (in case the loop is ever broken)
     for controller in controllers:
@@ -341,6 +368,7 @@ def monitor_proxies(control_password):
             controller.close()
         except:
             pass
+
 
 def select_proxy_round_robin():
     """Selects a proxy from the top N list using a round-robin strategy."""
