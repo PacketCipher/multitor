@@ -106,7 +106,7 @@ def check_proxy_ping_health(proxy_host, proxy_port, num_rounds=10, requests_per_
     return overall_avg_latency
 
 DOWNLOAD_MONITORING_INTERVAL = 60 * 60 # seconds
-def check_proxy_download_health(proxy_host, proxy_port, num_downloads=5):
+def check_proxy_download_health(proxy_host, proxy_port, num_downloads=1):
     """
     Measures the average time it takes to download a test file via a proxy.
 
@@ -117,7 +117,7 @@ def check_proxy_download_health(proxy_host, proxy_port, num_downloads=5):
         proxy_host (str): The proxy server hostname or IP address.
         proxy_port (int): The proxy server port.
         num_downloads (int): The number of times to download the file to find an
-                             average time. Defaults to 5.
+                             average time. Defaults to 1.
 
     Returns:
         float: The overall average download time in seconds, including penalties
