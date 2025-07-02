@@ -10,10 +10,43 @@ import stem
 import stem.control
 from stem import CircStatus, Signal
 from stem.control import EventType
-import queue # NEW: Import the queue module
+import queue
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s')
+
+# --- NEW CLASS: A thread-safe queue that prevents duplicate items ---
+class DedupeQueue(queue.Queue):
+    """
+    A custom queue class that inherits from queue.Queue but adds deduplication.
+
+    It ensures that an item cannot be added to the queue if it is already
+    present. This is crucial for the event-driven monitoring to prevent a
+    flurry of events for a single proxy from causing multiple redundant
+    health checks.
+
+    It uses an internal set for O(1) average time complexity for checking
+    item existence, and a lock to ensure that the check-and-add operations
+    are atomic and thread-safe.
+    """
+    def _init(self, maxsize):
+        super()._init(maxsize)
+        # The set to track items currently in the queue for fast lookups.
+        self.items_in_queue = set()
+
+    def _put(self, item):
+        # The core deduplication logic: only put the item if it's not
+        # already in our tracking set.
+        if item not in self.items_in_queue:
+            super()._put(item)
+            self.items_in_queue.add(item)
+
+    def _get(self):
+        # Get the item from the underlying deque.
+        item = super()._get()
+        # Remove the item from our tracking set as it's no longer in the queue.
+        self.items_in_queue.remove(item)
+        return item
 
 # --- MODIFIED: Shared state for the round-robin strategy ---
 TOP_N_PROXIES = None # The 'N' in "Top-N" round-robin
@@ -27,9 +60,10 @@ _round_robin_index = 0
 # Original list of proxies from arguments remains the same.
 _target_proxies = []
 
-# --- NEW: Queue to trigger targeted monitoring ---
+# --- MODIFIED: Queue to trigger targeted monitoring with deduplication ---
 # This queue will hold (host, port) tuples of proxies that need an update.
-_update_queue = queue.Queue()
+# Using the DedupeQueue prevents redundant checks for the same proxy.
+_update_queue = DedupeQueue()
 
 PING_MONITORING_INTERVAL = 60 # seconds
 def check_proxy_ping_health(proxy_host, proxy_port, num_rounds=10, requests_per_round=10):
@@ -58,7 +92,7 @@ def check_proxy_ping_health(proxy_host, proxy_port, num_rounds=10, requests_per_
         f"Configuration: {num_rounds} rounds, {requests_per_round} parallel requests per round "
         f"({total_requests} total requests)."
     )
-    
+
     # A single, thread-safe session is more efficient for multiple requests.
     session = requests.Session()
     session.proxies = {
@@ -87,11 +121,11 @@ def check_proxy_ping_health(proxy_host, proxy_port, num_rounds=10, requests_per_
     # The outer loop for each round of tests
     for i in range(num_rounds):
         round_start_time = time.time()
-        
+
         with ThreadPoolExecutor(max_workers=requests_per_round) as executor:
             futures = [executor.submit(_make_single_request) for _ in range(requests_per_round)]
             round_latencies = [f.result() for f in futures]
-        
+
         all_latencies.extend(round_latencies)
         round_duration = time.time() - round_start_time
         round_avg_latency = sum(round_latencies) / len(round_latencies)
@@ -111,7 +145,7 @@ def check_proxy_ping_health(proxy_host, proxy_port, num_rounds=10, requests_per_
     logging.info(f"Total time taken:    {total_duration:.4f} seconds")
     logging.info(f"Overall avg latency: {overall_avg_latency:.4f}s (includes penalties for failures)")
     logging.info("---------------------------------")
-    
+
     return overall_avg_latency
 
 DOWNLOAD_MONITORING_INTERVAL = 60 * 60 # seconds
@@ -197,7 +231,7 @@ def get_control_port(socks_port):
 
 def create_circuit_event_handler(proxy_tuple):
     """
-    NEW: Factory function that creates a targeted event handler.
+    Factory function that creates a targeted event handler.
     This allows the handler to know which proxy instance it's for.
     """
     host, port = proxy_tuple
@@ -207,12 +241,13 @@ def create_circuit_event_handler(proxy_tuple):
             logging.info(f"Tor circuit event ({event.status}) for proxy {host}:{port}. "
                          f"Queueing for a targeted health re-check.")
             # Put the specific proxy that had the event into the queue.
+            # The DedupeQueue will automatically prevent duplicates.
             _update_queue.put(proxy_tuple)
     return handler
 
 def _update_top_proxies_list(health_data):
     """
-    NEW HELPER: Takes a dictionary of health data, sorts it, and updates
+    Takes a dictionary of health data, sorts it, and updates
     the global _top_proxies list in a thread-safe way.
     """
     global _top_proxies
@@ -238,7 +273,7 @@ def _update_top_proxies_list(health_data):
 
 def monitor_proxies(control_password):
     """
-    MODIFIED: Periodically and on-demand checks proxy health.
+    Periodically and on-demand checks proxy health.
     - Runs a full check on all proxies periodically.
     - Runs a targeted check on a single proxy when triggered by a Tor event.
     """
@@ -258,7 +293,7 @@ def monitor_proxies(control_password):
     proxy_health_data = {}
 
     def _run_full_check_cycle():
-        """NEW HELPER: Checks all target proxies and updates health data."""
+        """Checks all target proxies and updates health data."""
         logging.info("--- Running full periodic health check on all target proxies... ---")
         if not _target_proxies:
             logging.warning("Monitor: No target proxies configured.")
@@ -345,7 +380,7 @@ def select_proxy_round_robin():
         # Select proxy using round-robin logic
         selected_proxy = _top_proxies[_round_robin_index % len(_top_proxies)]
         _round_robin_index += 1
-        
+
         # Prevent the index from growing indefinitely (optional, but good practice)
         if _round_robin_index > 1000000:
              _round_robin_index = 0
@@ -389,7 +424,7 @@ def handle_client_connection(client_socket, client_address):
         client_req_header = client_socket.recv(4)
         if not client_req_header or len(client_req_header) < 4:
             logging.warning(f"Client {client_address} sent incomplete request header. Closing."); client_socket.close(); return
-        
+
         req_ver, req_cmd, _, req_atyp = client_req_header
         if req_ver != 0x05 or req_cmd != 0x01: # Check for SOCKSv5 CONNECT
             logging.error(f"Unsupported request from {client_address}: VER={req_ver}, CMD={req_cmd}. Sending error.")
@@ -406,7 +441,7 @@ def handle_client_connection(client_socket, client_address):
         else:
             logging.error(f"Unsupported ATYP from {client_address}: {req_atyp}. Sending error.")
             client_socket.sendall(b'\x05\x08\x00\x01\x00\x00\x00\x00\x00\x00'); client_socket.close(); return
-        
+
         dst_port_bytes = client_socket.recv(2)
         if len(dst_addr_bytes) < 1 or len(dst_port_bytes) < 2:
              logging.warning(f"Client {client_address} sent incomplete address/port. Closing."); client_socket.close(); return
@@ -431,10 +466,10 @@ def handle_client_connection(client_socket, client_address):
         proxy_reply_header = proxy_socket.recv(4)
         if not proxy_reply_header or len(proxy_reply_header) < 4:
             raise ConnectionAbortedError("Upstream proxy closed connection before sending reply header.")
-        
+
         client_socket.sendall(proxy_reply_header)
         reply_atyp = proxy_reply_header[3]
-        
+
         bnd_len = 0
         if reply_atyp == 0x01: bnd_len = 4
         elif reply_atyp == 0x04: bnd_len = 16
@@ -442,7 +477,7 @@ def handle_client_connection(client_socket, client_address):
             len_byte = proxy_socket.recv(1)
             client_socket.sendall(len_byte)
             bnd_len = len_byte[0]
-        
+
         bnd_full = proxy_socket.recv(bnd_len + 2)
         client_socket.sendall(bnd_full)
 
@@ -559,7 +594,7 @@ if __name__ == "__main__":
         exit(1)
 
     # It's good practice to wait a bit for Tor instances to bootstrap
-    logging.info("Waiting 10 minute for Tor instances to initialize...")
+    logging.info("Waiting 10 minutes for Tor instances to initialize...")
     time.sleep(10 * 60)
 
     TOP_N_PROXIES = args.top_n_proxies
