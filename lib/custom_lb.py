@@ -6,7 +6,7 @@ import logging
 import argparse
 import socks
 from concurrent.futures import ThreadPoolExecutor
-from functools import partial # <-- IMPORTED
+from functools import partial
 import stem
 import stem.control
 import stem.response
@@ -180,36 +180,41 @@ def _run_full_check_cycle():
     _update_proxy_lists(health_data)
     logging.info("--- Full health check audit complete. ---")
 
-# --- REWORKED EVENT HANDLERS ---
+# --- FIXED & CORRECT EVENT HANDLERS ---
 def generic_guard_handler(proxy_tuple, event):
-    """Generic handler for GUARD events, with proxy context pre-filled."""
-    if event.status in [GuardStatus.DOWN, GuardStatus.UNUSABLE]:
-        logging.info(f"Proxy {proxy_tuple} reported guard status: {event.status}. Triggering removal.")
+    """Handles GUARD events. This logic was correct."""
+    if event.status in [GuardStatus.DOWN, GuardStatus.BAD]:
+        logging.warning(f"Proxy {proxy_tuple} reported guard status: {event.status}. Triggering removal.")
         trigger_reactive_removal(proxy_tuple, f"GUARD {event.status}")
 
-def generic_status_handler(proxy_tuple, controller, event):
-    """Generic handler for STATUS_CLIENT events, with proxy context pre-filled."""
+def generic_status_handler(proxy_tuple, event):
+    """
+    FIXED: Handles only STATUS_CLIENT events.
+    Reacts directly to the event's content, avoiding a redundant getinfo call.
+    """
     if event.action == "BOOTSTRAP":
-        try:
-            if not is_bootstrapped(controller):
-                progress = event.arguments.get('PROGRESS', 'N/A')
-                logging.info(f"Proxy {proxy_tuple} is re-bootstrapping (progress {progress}%). Verifying with getinfo confirmed non-bootstrapped state.")
-                trigger_reactive_removal(proxy_tuple, f"BOOTSTRAP RESTART (progress {progress}%)")
-        except stem.SocketError:
-            logging.error(f"Control socket for {proxy_tuple} died during status check. Removing.")
-            trigger_reactive_removal(proxy_tuple, "CONTROL PORT DISCONNECTED")
-        except Exception as e:
-            logging.error(f"Error checking bootstrap status for {proxy_tuple} during event: {e}")
-            trigger_reactive_removal(proxy_tuple, "CONTROL PORT ERROR")
-    
-    elif event.action == "NETWORK_LIVENESS" and event.arguments.get("LIVENESS") == "down":
-        logging.warning(f"Proxy {proxy_tuple} reported network is down. Triggering removal.")
+        progress = int(event.arguments.get('PROGRESS', -1))
+        tag = event.arguments.get('TAG', 'unknown')
+
+        # Any bootstrap event that isn't the final "done" one implies it's not ready.
+        if tag != 'done' or progress < 100:
+            logging.info(f"Proxy {proxy_tuple} is (re)bootstrapping (progress {progress}%, tag: {tag}). Removing from active pool.")
+            trigger_reactive_removal(proxy_tuple, f"BOOTSTRAP RESTART (progress {progress}%)")
+
+def network_liveness_handler(proxy_tuple, event):
+    """
+    NEW: Handles only NETWORK_LIVENESS events. This is a separate event type
+    from STATUS_CLIENT and needs its own handler.
+    """
+    # As per the stem unittests, the status is on the event object directly.
+    if event.status == "DOWN":
+        logging.warning(f"Proxy {proxy_tuple} reported network is DOWN. Triggering removal.")
         trigger_reactive_removal(proxy_tuple, "NETWORK LIVENESS DOWN")
 
 def monitor_proxies(bootstrapped_controllers):
     """
-    Monitors proxy health. Reacts to GUARD and STATUS events, with a periodic check as a fallback.
-    Receives a dictionary of pre-connected and authenticated controllers.
+    Monitors proxy health. Reacts to GUARD, STATUS, and NETWORK_LIVENESS events,
+    with a periodic check as a fallback.
     """
     if CHECK_MODE == 0:
         MONITORING_INTERVAL = PING_MONITORING_INTERVAL
@@ -219,19 +224,20 @@ def monitor_proxies(bootstrapped_controllers):
         logging.error(f"Invalid CHECK_MODE '{CHECK_MODE}'. Monitor thread exiting.")
         return
 
-    # --- REWORKED LISTENER REGISTRATION ---
-    # Use functools.partial to create specialized callbacks for each controller.
-    # Each callback will have the 'proxy_tuple' and 'controller' arguments pre-filled.
+    # --- FIXED: Register all three distinct handlers for the correct event types ---
     for proxy_tuple, controller in bootstrapped_controllers.items():
-        # Create a guard handler that knows its proxy_tuple
         guard_handler = partial(generic_guard_handler, proxy_tuple)
-        
-        # Create a status handler that knows its proxy_tuple AND its controller
-        status_handler = partial(generic_status_handler, proxy_tuple, controller)
+        status_handler = partial(generic_status_handler, proxy_tuple)
+        liveness_handler = partial(network_liveness_handler, proxy_tuple)
 
-        controller.add_event_listener(guard_handler, EventType.GUARD)
-        controller.add_event_listener(status_handler, EventType.STATUS_CLIENT)
-        logging.info(f"Event listeners added for {proxy_tuple}")
+        try:
+            controller.add_event_listener(guard_handler, EventType.GUARD)
+            controller.add_event_listener(status_handler, EventType.STATUS_CLIENT)
+            controller.add_event_listener(liveness_handler, EventType.NETWORK_LIVENESS)
+            logging.info(f"Event listeners (GUARD, STATUS_CLIENT, NETWORK_LIVENESS) added for {proxy_tuple}")
+        except Exception as e:
+            logging.error(f"Failed to add event listeners for {proxy_tuple}: {e}")
+
 
     while True:
         event_was_set = _full_recheck_needed_event.wait(timeout=MONITORING_INTERVAL)
@@ -247,6 +253,7 @@ def monitor_proxies(bootstrapped_controllers):
             controller.close()
         except Exception:
             pass
+
 
 def select_proxy_round_robin():
     """Selects a proxy from the top N list using a round-robin strategy."""
