@@ -363,7 +363,11 @@ def handle_client_connection(client_socket, client_address):
             logging.error(f"Upstream SOCKS proxy {upstream_host}:{upstream_port} failed request for {client_address}. REP: {proxy_reply_header[1]}.")
 
     except (socket.error, socks.SOCKS5Error, BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as e:
-        logging.error(f"Error during SOCKS relay for {client_address}: {e}")
+        logging.error(f"Error during SOCKS relay for {client_address} via {upstream_proxy}: {e}")
+        # TODO: Add Packet Success Rate Metric
+        # if upstream_proxy:
+        #     trigger_reactive_removal(upstream_proxy, "SOCKS FAILURE")
+        
         if not client_socket._closed:
             try:
                 client_socket.sendall(b'\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00')
