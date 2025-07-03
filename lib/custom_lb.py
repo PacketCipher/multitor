@@ -4,17 +4,17 @@ import time
 import requests
 import logging
 import argparse
-import socks # PySocks
+import socks # PySocks, used for potential error types
 from concurrent.futures import ThreadPoolExecutor
 import stem
 import stem.control
-from stem import CircStatus, Signal
+from stem import CircStatus
 from stem.control import EventType
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s')
 
-# --- MODIFIED: Shared state and trigger mechanism ---
+# --- Shared state and trigger mechanism ---
 TOP_N_PROXIES = None # The 'N' in "Top-N" round-robin
 CHECK_MODE = None
 _shared_state_lock = threading.Lock()
@@ -34,18 +34,14 @@ PING_MONITORING_INTERVAL = 1 * 60 * 60
 DOWNLOAD_MONITORING_INTERVAL = 4 * 60 * 60
 
 def check_proxy_ping_health(proxy_host, proxy_port, num_rounds=10, requests_per_round=10):
-    """
-    Measures proxy performance by running multiple rounds of parallel requests.
-    (This function is unchanged)
-    """
+    """Measures proxy performance by running multiple rounds of parallel requests."""
     TEST_URL = "http://connectivitycheck.gstatic.com/generate_204"
     HEALTH_CHECK_TIMEOUT = 5 # seconds
 
     total_requests = num_rounds * requests_per_round
     logging.info(
         f"--- Starting Performance Test for {proxy_host}:{proxy_port} ---\n"
-        f"Configuration: {num_rounds} rounds, {requests_per_round} parallel requests per round "
-        f"({total_requests} total requests)."
+        f"Configuration: {num_rounds} rounds, {requests_per_round} parallel requests per round."
     )
     session = requests.Session()
     session.proxies = {
@@ -64,11 +60,9 @@ def check_proxy_ping_health(proxy_host, proxy_port, num_rounds=10, requests_per_
             return HEALTH_CHECK_TIMEOUT
 
     all_latencies = []
-    for i in range(num_rounds):
-        with ThreadPoolExecutor(max_workers=requests_per_round) as executor:
-            futures = [executor.submit(_make_single_request) for _ in range(requests_per_round)]
-            round_latencies = [f.result() for f in futures]
-        all_latencies.extend(round_latencies)
+    with ThreadPoolExecutor(max_workers=requests_per_round * num_rounds) as executor:
+        futures = [executor.submit(_make_single_request) for _ in range(total_requests)]
+        all_latencies = [f.result() for f in futures]
 
     overall_avg_latency = sum(all_latencies) / len(all_latencies) if all_latencies else HEALTH_CHECK_TIMEOUT
     success_count = sum(1 for lat in all_latencies if lat < HEALTH_CHECK_TIMEOUT)
@@ -81,10 +75,7 @@ def check_proxy_ping_health(proxy_host, proxy_port, num_rounds=10, requests_per_
     return overall_avg_latency
 
 def check_proxy_download_health(proxy_host, proxy_port, num_downloads=1):
-    """
-    Measures the average time it takes to download a test file via a proxy.
-    (This function is unchanged)
-    """
+    """Measures the average time it takes to download a test file via a proxy."""
     DOWNLOAD_URL = "https://proof.ovh.net/files/1Mb.dat"
     DOWNLOAD_TIMEOUT = 30 # in seconds
 
@@ -121,31 +112,25 @@ def create_circuit_event_handler(proxy_tuple):
     def handler(event):
         if event.status == CircStatus.CLOSED:
             with _shared_state_lock:
-                # Check if this proxy is in our master list of healthy ones.
                 if proxy_tuple in _healthy_sorted_proxies:
                     logging.warning(
                         f"Tor circuit event ({event.status}) for proxy {host}:{port}. "
                         f"Reactively removing it from the healthy list."
                     )
-                    # 1. Remove from the master list
                     _healthy_sorted_proxies.remove(proxy_tuple)
 
-                    # 2. Immediately update the derived top-N list
                     global _top_proxies, _round_robin_index
                     new_top_proxies = _healthy_sorted_proxies[:TOP_N_PROXIES]
                     if _top_proxies != new_top_proxies:
-                        logging.info(f"Top-N list has been updated due to removal. New list: {new_top_proxies}")
+                        logging.info(f"Top-N list updated due to removal. New list: {new_top_proxies}")
                         _top_proxies = new_top_proxies
-                        _round_robin_index = 0 # Reset index to prevent out-of-bounds
+                        _round_robin_index = 0
 
-                    logging.info(f"Total healthy proxies remaining: {len(_healthy_sorted_proxies)}. "
-                                 f"Active top-N list size: {len(_top_proxies)}.")
+                    logging.info(f"Total healthy proxies: {len(_healthy_sorted_proxies)}. Active top-N: {len(_top_proxies)}.")
 
-                    # 3. Check if we need to trigger a full re-check.
                     if len(_healthy_sorted_proxies) < TOP_N_PROXIES:
-                        logging.error(f"Number of healthy proxies ({len(_healthy_sorted_proxies)}) "
-                                      f"has fallen below the required N ({TOP_N_PROXIES}). "
-                                      f"Triggering an immediate full re-check.")
+                        logging.error(f"Healthy proxies ({len(_healthy_sorted_proxies)}) < N ({TOP_N_PROXIES}). "
+                                      f"Triggering immediate full re-check.")
                         _full_recheck_needed_event.set()
     return handler
 
@@ -155,7 +140,6 @@ def _update_proxy_lists(health_data):
     and the derived top-N list for round-robin.
     """
     global _healthy_sorted_proxies, _top_proxies, _round_robin_index
-    # health_data is a dict: {(host, port): performance_metric}
     sorted_proxies_with_metric = sorted(health_data.items(), key=lambda item: item[1])
     new_healthy_sorted = [proxy for proxy, metric in sorted_proxies_with_metric]
 
@@ -167,7 +151,7 @@ def _update_proxy_lists(health_data):
             logging.warning("No healthy proxies found after full check. Active proxy list is empty.")
         elif _top_proxies != new_top_proxies:
             logging.info(f"Updating proxy lists. New top-N list: {new_top_proxies}")
-            _round_robin_index = 0 # Reset index as the list has changed
+            _round_robin_index = 0
         else:
             logging.info(f"Top-N proxies list remains unchanged: {new_top_proxies}")
 
@@ -176,9 +160,7 @@ def _update_proxy_lists(health_data):
 
 def monitor_proxies(control_password):
     """
-    Monitors proxy health.
-    - Runs a full check periodically.
-    - Runs an immediate full check if the number of healthy proxies drops below N.
+    Monitors proxy health. Runs a full check periodically or if healthy proxies < N.
     """
     if CHECK_MODE == 0:
         check_func = check_proxy_ping_health
@@ -191,27 +173,24 @@ def monitor_proxies(control_password):
         return
 
     def _run_full_check_cycle():
-        """Checks all target proxies and updates the global lists."""
         health_data = {}
         if not _target_proxies:
             logging.warning("Monitor: No target proxies configured.")
-        else:
-            logging.info(f"Starting full health check on all target proxies: {_target_proxies}")
-            for host, port in _target_proxies:
-                try:
-                    performance_metric = check_func(host, port)
-                    health_data[(host, port)] = performance_metric
-                except Exception as e:
-                    logging.error(f"Error during health check for proxy {host}:{port}: {e}", exc_info=False)
-        # After checking all, update the global lists
+            return
+
+        logging.info(f"Starting full health check on all target proxies: {_target_proxies}")
+        for host, port in _target_proxies:
+            try:
+                performance_metric = check_func(host, port)
+                health_data[(host, port)] = performance_metric
+            except Exception as e:
+                logging.error(f"Error during health check for proxy {host}:{port}: {e}", exc_info=False)
         _update_proxy_lists(health_data)
         logging.info("--- Full health check cycle complete. ---")
 
-    # 1. Initial check
     logging.info("--- Running initial health check on all target proxies... ---")
     _run_full_check_cycle()
 
-    # 2. Setup Stem Controllers
     controllers = []
     for host, port in _target_proxies:
         try:
@@ -224,7 +203,6 @@ def monitor_proxies(control_password):
         except Exception as e:
             logging.warning(f"Failed to connect/auth with Tor control for {host}:{port}: {e}.")
 
-    # 3. Main Monitoring Loop
     while True:
         event_was_set = _full_recheck_needed_event.wait(timeout=MONITORING_INTERVAL)
         if event_was_set:
@@ -235,116 +213,150 @@ def monitor_proxies(control_password):
         _run_full_check_cycle()
 
     for controller in controllers:
-        try: controller.close()
-        except: pass
+        try:
+            controller.close()
+        except Exception:
+            pass
 
 def select_proxy_round_robin():
     """Selects a proxy from the top N list using a round-robin strategy."""
     global _round_robin_index
     with _shared_state_lock:
         if not _top_proxies:
-            return None # No healthy proxies available
+            return None
 
         selected_proxy = _top_proxies[_round_robin_index % len(_top_proxies)]
         _round_robin_index += 1
         return selected_proxy
 
 def handle_client_connection(client_socket, client_address):
-    """Handles a single client connection, forwarding it through a selected SOCKS5 proxy."""
+    """Handles a single client connection by forwarding it through a selected SOCKS5 proxy."""
     logging.info(f"Accepted connection from {client_address}")
     proxy_socket = None
 
     try:
-        # --- Use the round-robin selection function ---
         upstream_proxy = select_proxy_round_robin()
         if not upstream_proxy:
-            logging.error(f"No healthy upstream SOCKS proxy available for {client_address}. Closing connection.")
+            logging.error(f"No healthy upstream SOCKS proxy for {client_address}. Closing connection.")
             client_socket.close()
             return
 
         upstream_host, upstream_port = upstream_proxy
-        logging.info(f"Selected upstream SOCKS proxy {upstream_host}:{upstream_port} for {client_address} via round-robin")
+        logging.info(f"Selected upstream SOCKS proxy {upstream_host}:{upstream_port} for {client_address}")
 
-        # --- SOCKS5 relay logic (unchanged) ---
-        # 2. Handshake with client
+        # SOCKS5 handshake with client
         version_id_msg = client_socket.recv(2)
-        if not version_id_msg or version_id_msg[0] != 0x05: client_socket.close(); return
+        if not version_id_msg or version_id_msg[0] != 0x05:
+            client_socket.close()
+            return
         nmethods = version_id_msg[1]
         client_methods = client_socket.recv(nmethods)
-        if 0x00 not in client_methods: client_socket.sendall(b'\x05\xFF'); client_socket.close(); return
+        if 0x00 not in client_methods:
+            client_socket.sendall(b'\x05\xFF')
+            client_socket.close()
+            return
         client_socket.sendall(b'\x05\x00')
 
-        # 3. Get destination from client
+        # Get destination request from client
         client_req_header = client_socket.recv(4)
         if not client_req_header or client_req_header[0] != 0x05 or client_req_header[1] != 0x01:
-            client_socket.sendall(b'\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00'); client_socket.close(); return
+            client_socket.sendall(b'\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00')
+            client_socket.close()
+            return
         req_atyp = client_req_header[3]
-        if req_atyp == 0x01: dst_addr_bytes = client_socket.recv(4)
-        elif req_atyp == 0x03:
-            domain_len = client_socket.recv(1)[0]
-            dst_addr_bytes = b'\x03' + bytes([domain_len]) + client_socket.recv(domain_len)
-        elif req_atyp == 0x04: dst_addr_bytes = client_socket.recv(16)
-        else: client_socket.sendall(b'\x05\x08\x00\x01\x00\x00\x00\x00\x00\x00'); client_socket.close(); return
+        if req_atyp == 0x01: # IPv4
+            dst_addr_bytes = client_socket.recv(4)
+        elif req_atyp == 0x03: # Domain name
+            domain_len_byte = client_socket.recv(1)
+            domain_len = domain_len_byte[0]
+            dst_addr_bytes = domain_len_byte + client_socket.recv(domain_len)
+        elif req_atyp == 0x04: # IPv6
+            dst_addr_bytes = client_socket.recv(16)
+        else:
+            client_socket.sendall(b'\x05\x08\x00\x01\x00\x00\x00\x00\x00\x00')
+            client_socket.close()
+            return
         dst_port_bytes = client_socket.recv(2)
 
-        # 4. Connect to upstream proxy
-        proxy_socket = socks.socksocket()
-        proxy_socket.set_proxy(socks.SOCKS5, upstream_host, upstream_port)
+        # Connect to upstream SOCKS proxy
+        proxy_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         proxy_socket.settimeout(10)
+        proxy_socket.connect((upstream_host, upstream_port))
+        proxy_socket.sendall(b'\x05\x01\x00') # Handshake with upstream
+        server_choice = proxy_socket.recv(2)
+        if not server_choice or server_choice[0] != 0x05 or server_choice[1] != 0x00:
+            raise socks.SOCKS5Error("Upstream proxy auth failed")
 
-        # 5. Connect to final destination THROUGH the upstream proxy
-        # The SOCKS5 handshake with the client's destination is a bit different here.
-        # We re-create the client's original request.
-        target_host = socket.inet_ntoa(dst_addr_bytes) if req_atyp == 0x01 else \
-                      (dst_addr_bytes[2:].decode() if req_atyp == 0x03 else
-                       socket.inet_ntop(socket.AF_INET6, dst_addr_bytes))
-        target_port = int.from_bytes(dst_port_bytes, 'big')
-        
-        logging.debug(f"Relaying connection for {client_address} to {target_host}:{target_port} via {upstream_host}:{upstream_port}")
-        proxy_socket.connect((target_host, target_port))
-        
-        # 6. Send success reply to client
-        # We need to get the bind address from the successful connection to send back.
-        # However, a simple success is sufficient for most clients.
-        client_socket.sendall(b'\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00')
-        
-        # 7. Relay data
-        logging.info(f"SOCKS connection established for {client_address}. Relaying data.")
-        relay_data(client_socket, proxy_socket, client_address)
+        # Forward client's original request to upstream
+        upstream_request = client_req_header + dst_addr_bytes + dst_port_bytes
+        proxy_socket.sendall(upstream_request)
 
-    except (socket.error, socks.SOCKS5Error, BrokenPipeError, ConnectionResetError, ConnectionAbortedError, IndexError) as e:
+        # Relay upstream proxy's response back to our client
+        proxy_reply_header = proxy_socket.recv(4)
+        if not proxy_reply_header:
+             raise ConnectionAbortedError("Upstream proxy did not send reply header.")
+        client_socket.sendall(proxy_reply_header)
+        reply_atyp = proxy_reply_header[3]
+        bnd_len = 0
+        if reply_atyp == 0x01: bnd_len = 4 + 2 # IPv4 + port
+        elif reply_atyp == 0x04: bnd_len = 16 + 2 # IPv6 + port
+        elif reply_atyp == 0x03:
+            len_byte = proxy_socket.recv(1)
+            client_socket.sendall(len_byte)
+            bnd_len = len_byte[0] + 2 # domain + port
+        # Relay the rest of the bind address and port
+        bnd_full = proxy_socket.recv(bnd_len)
+        client_socket.sendall(bnd_full)
+
+        # Relay data if connection was successful
+        if proxy_reply_header[1] == 0x00:
+            logging.info(f"SOCKS connection established for {client_address}. Relaying data.")
+            relay_data(client_socket, proxy_socket, client_address)
+
+    except (socket.error, socks.SOCKS5Error, BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as e:
         logging.error(f"Error during SOCKS relay for {client_address}: {e}")
         if not client_socket._closed:
-            try: client_socket.sendall(b'\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00')
-            except socket.error: pass
+            try:
+                client_socket.sendall(b'\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00')
+            except socket.error:
+                pass
     finally:
-        if client_socket and not client_socket._closed: client_socket.close()
-        if proxy_socket and not proxy_socket._closed: proxy_socket.close()
+        if client_socket and not client_socket._closed:
+            client_socket.close()
+        if proxy_socket and not proxy_socket._closed:
+            proxy_socket.close()
         logging.info(f"Closed connection for {client_address}")
 
 def relay_data(sock1, sock2, client_address):
     """Relays data between two sockets until one closes or an error occurs."""
     done_event = threading.Event()
-    def _forward(s_from, s_to, direction):
+    def _forward(s_from, s_to):
         try:
             while not done_event.is_set():
                 data = s_from.recv(4096)
-                if not data: break
+                if not data:
+                    break
                 s_to.sendall(data)
-        except (socket.error, BrokenPipeError, ConnectionResetError): pass
-        finally: done_event.set()
+        except (socket.error, BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            done_event.set()
 
-    t1 = threading.Thread(target=_forward, args=(sock1, sock2, "c2p"))
-    t2 = threading.Thread(target=_forward, args=(sock2, sock1, "p2c"))
-    t1.daemon = t2.daemon = True
-    t1.start(); t2.start()
+    t1 = threading.Thread(target=_forward, args=(sock1, sock2))
+    t2 = threading.Thread(target=_forward, args=(sock2, sock1))
+    t1.daemon = True
+    t2.daemon = True
+    t1.start()
+    t2.start()
     done_event.wait()
     for s in [sock1, sock2]:
         if not s._closed:
-            try: s.shutdown(socket.SHUT_RDWR)
-            except socket.error: pass
-            finally: s.close()
-    logging.debug(f"Relay finished for {client_address}")
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except socket.error:
+                pass
+            finally:
+                s.close()
 
 def start_server(listen_host, listen_port):
     """Starts the SOCKS5 proxy server and listens for connections."""
@@ -363,9 +375,11 @@ def start_server(listen_host, listen_port):
     while True:
         try:
             client_socket, client_address = server_socket.accept()
-            threading.Thread(target=handle_client_connection, args=(client_socket, client_address), daemon=True).start()
+            client_thread = threading.Thread(target=handle_client_connection, args=(client_socket, client_address), daemon=True)
+            client_thread.start()
         except KeyboardInterrupt:
-            logging.info("Server shutting down."); break
+            logging.info("Server shutting down.")
+            break
         except socket.error as e:
             logging.error(f"Socket error during accept: {e}")
     server_socket.close()
@@ -377,13 +391,20 @@ if __name__ == "__main__":
     parser.add_argument("--tor-proxies", type=str, required=True, help="Comma-separated list of Tor SOCKS5 proxies")
     parser.add_argument("--top-n-proxies", type=int, required=True, help="Round-robin over the Top N fastest proxies.")
     parser.add_argument("--check-mode", type=int, required=True, choices=[0, 1], help="0 = Ping Check, 1 = Download Check")
-    parser.add_argument("--tor-control-password", type=str, default=None, help="Password for the Tor control ports.")
+    parser.add_argument("--tor-control-password", type=str, default="", help="Password for the Tor control ports. Default is empty for no auth or cookie auth.")
 
     args = parser.parse_args()
 
     try:
-        _target_proxies = [(h.strip(), int(p)) for h, p in (x.split(':') for x in args.tor_proxies.split(',')) if x.strip()]
-        if not _target_proxies: raise ValueError("No proxies provided.")
+        proxies_list = []
+        for proxy_str in args.tor_proxies.split(','):
+            if not proxy_str.strip():
+                continue
+            host, port_str = proxy_str.strip().split(':')
+            proxies_list.append((host, int(port_str)))
+        _target_proxies = proxies_list
+        if not _target_proxies:
+            raise ValueError("No valid proxies were provided.")
         logging.info(f"Target Tor SOCKS proxies: {_target_proxies}")
     except ValueError as e:
         logging.error(f"Invalid format for --tor-proxies: {args.tor_proxies}. Error: {e}. Exiting.")
@@ -391,24 +412,23 @@ if __name__ == "__main__":
 
     TOP_N_PROXIES = args.top_n_proxies
     if TOP_N_PROXIES > len(_target_proxies):
-        logging.warning(f"--top-n-proxies ({TOP_N_PROXIES}) is greater than total proxies ({len(_target_proxies)}). Using {len(_target_proxies)} instead.")
+        logging.warning(f"--top-n-proxies ({TOP_N_PROXIES}) > total proxies ({len(_target_proxies)}). Using {len(_target_proxies)}.")
         TOP_N_PROXIES = len(_target_proxies)
 
     CHECK_MODE = args.check_mode
 
-    # It's good practice to wait a bit for Tor instances to bootstrap
     logging.info("Waiting 10 minutes for Tor instances to initialize...")
     time.sleep(10 * 60)
 
     monitor_thread = threading.Thread(target=monitor_proxies, args=(args.tor_control_password,), daemon=True)
     monitor_thread.start()
 
-    # Wait for the first check to complete before starting the server
-    time.sleep(30) # Give monitor thread time to run its first check
+    logging.info("Waiting up to 5 minutes for the initial health check to complete...")
+    time.sleep(5 * 60)
     with _shared_state_lock:
         if not _top_proxies:
             logging.warning("Initial health check found no working proxies. Starting server anyway.")
-    
+
     try:
         start_server(args.listen_host, args.listen_port)
     except Exception as e:
