@@ -110,7 +110,7 @@ def create_circuit_event_handler(proxy_tuple):
     """
     host, port = proxy_tuple
     def handler(event):
-        if event.status == CircStatus.CLOSED:
+        if event.status in [CircStatus.BUILT, CircStatus.CLOSED]:
             with _shared_state_lock:
                 if proxy_tuple in _healthy_sorted_proxies:
                     logging.warning(
