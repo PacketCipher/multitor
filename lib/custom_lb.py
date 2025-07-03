@@ -4,18 +4,17 @@ import time
 import requests
 import logging
 import argparse
-import socks # PySocks, used for potential error types
+import socks
 from concurrent.futures import ThreadPoolExecutor
 import stem
 import stem.control
-from stem import CircStatus
-from stem.control import EventType
+from stem import EventType, GuardStatus, StatusType
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s')
 
 # --- Shared state and trigger mechanism ---
-TOP_N_PROXIES = None # The 'N' in "Top-N" round-robin
+TOP_N_PROXIES = None
 CHECK_MODE = None
 _shared_state_lock = threading.Lock()
 # Master list of ALL healthy proxies, sorted by performance (best first).
@@ -103,43 +102,38 @@ def get_control_port(socks_port):
     """Derives the Tor control port from a SOCKS port."""
     return int(socks_port) + 900
 
-def create_circuit_event_handler(proxy_tuple):
+def trigger_reactive_removal(proxy_tuple, reason):
     """
-    Factory for an event handler that removes a failing proxy from the healthy list
-    and triggers a full re-check if the number of healthy proxies drops below N.
+    Central function to handle a reactive failure.
+    It removes the failed proxy and only triggers a full re-check if the
+    number of healthy proxies falls below the critical threshold.
     """
-    host, port = proxy_tuple
-    def handler(event):
-        if event.status in [CircStatus.BUILT, CircStatus.CLOSED]:
-            with _shared_state_lock:
-                if proxy_tuple in _healthy_sorted_proxies:
-                    logging.warning(
-                        f"Tor circuit event ({event.status}) for proxy {host}:{port}. "
-                        f"Reactively removing it from the healthy list."
-                    )
-                    _healthy_sorted_proxies.remove(proxy_tuple)
+    with _shared_state_lock:
+        if proxy_tuple in _healthy_sorted_proxies:
+            logging.warning(f"REACTIVE TRIGGER ({reason}) for proxy {proxy_tuple}. Removing from active pool.")
+            _healthy_sorted_proxies.remove(proxy_tuple)
 
-                    global _top_proxies, _round_robin_index
-                    new_top_proxies = _healthy_sorted_proxies[:TOP_N_PROXIES]
-                    if _top_proxies != new_top_proxies:
-                        logging.info(f"Top-N list updated due to removal. New list: {new_top_proxies}")
-                        _top_proxies = new_top_proxies
-                        _round_robin_index = 0
+            # Rebuild the top-N list from the now smaller healthy list
+            global _top_proxies, _round_robin_index
+            new_top_proxies = _healthy_sorted_proxies[:TOP_N_PROXIES]
+            if _top_proxies != new_top_proxies:
+                _top_proxies = new_top_proxies
+                _round_robin_index = 0
+                logging.info(f"Top-N list updated due to removal. New list: {new_top_proxies}")
 
-                    logging.info(f"Total healthy proxies: {len(_healthy_sorted_proxies)}. Active top-N: {len(_top_proxies)}.")
-
-                    if len(_healthy_sorted_proxies) < TOP_N_PROXIES:
-                        logging.error(f"Healthy proxies ({len(_healthy_sorted_proxies)}) < N ({TOP_N_PROXIES}). "
-                                      f"Triggering immediate full re-check.")
-                        _full_recheck_needed_event.set()
-    return handler
+            # Conditionally trigger a full re-check
+            if len(_healthy_sorted_proxies) < TOP_N_PROXIES:
+                logging.error(f"Healthy proxies ({len(_healthy_sorted_proxies)}) dropped below threshold ({TOP_N_PROXIES}). Triggering emergency re-check.")
+                _full_recheck_needed_event.set()
+        else:
+            logging.info(f"Reactive trigger for {proxy_tuple} ignored as it was already removed.")
 
 def _update_proxy_lists(health_data):
     """
-    Takes health data, sorts it, and updates both the master healthy list
-    and the derived top-N list for round-robin.
+    Takes health data from a full check, sorts it, and updates the global proxy lists.
     """
     global _healthy_sorted_proxies, _top_proxies, _round_robin_index
+    # Lower score is better (faster)
     sorted_proxies_with_metric = sorted(health_data.items(), key=lambda item: item[1])
     new_healthy_sorted = [proxy for proxy, metric in sorted_proxies_with_metric]
 
@@ -160,7 +154,8 @@ def _update_proxy_lists(health_data):
 
 def monitor_proxies(control_password):
     """
-    Monitors proxy health. Runs a full check periodically or if healthy proxies < N.
+    Monitors proxy health. Reacts to SOCKS failures, GUARD events, and STATUS
+    events, with a periodic check as a fallback.
     """
     if CHECK_MODE == 0:
         check_func = check_proxy_ping_health
@@ -178,7 +173,7 @@ def monitor_proxies(control_password):
             logging.warning("Monitor: No target proxies configured.")
             return
 
-        logging.info(f"Starting full health check on all target proxies: {_target_proxies}")
+        logging.info(f"Starting full health check audit on all target proxies: {_target_proxies}")
         for host, port in _target_proxies:
             try:
                 performance_metric = check_func(host, port)
@@ -186,33 +181,48 @@ def monitor_proxies(control_password):
             except Exception as e:
                 logging.error(f"Error during health check for proxy {host}:{port}: {e}", exc_info=False)
         _update_proxy_lists(health_data)
-        logging.info("--- Full health check cycle complete. ---")
+        logging.info("--- Full health check audit complete. ---")
 
-    logging.info("--- Running initial health check on all target proxies... ---")
+    # Initial check to populate lists before starting
     _run_full_check_cycle()
 
-    controllers = []
+    # --- Set up event listeners ---
+    controllers = {} # Use a dictionary to map controller back to proxy
     for host, port in _target_proxies:
         try:
             controller = stem.control.Controller.from_port(address=host, port=get_control_port(port))
             controller.authenticate(password=control_password)
-            handler = create_circuit_event_handler((host, port))
-            controller.add_event_listener(handler, EventType.CIRC)
-            logging.info(f"Successfully connected to Tor control port for {host}:{port}.")
-            controllers.append(controller)
+            controllers[controller] = (host, port)
+            logging.info(f"Successfully connected to Tor control for {host}:{port}.")
         except Exception as e:
             logging.warning(f"Failed to connect/auth with Tor control for {host}:{port}: {e}.")
+
+    def guard_event_handler(event):
+        proxy_tuple = controllers.get(event.controller)
+        if not proxy_tuple: return
+        if event.status == GuardStatus.DOWN:
+            trigger_reactive_removal(proxy_tuple, "GUARD DOWN")
+
+    def status_event_handler(event):
+        proxy_tuple = controllers.get(event.controller)
+        if not proxy_tuple: return
+        if event.action == "BOOTSTRAP_STATUS" and event.arguments.get('PROGRESS', '100') != '100':
+            trigger_reactive_removal(proxy_tuple, "BOOTSTRAP RESTART")
+
+    for controller in controllers.keys():
+        controller.add_event_listener(guard_event_handler, EventType.GUARD)
+        controller.add_event_listener(status_event_handler, EventType.STATUS_CLIENT)
 
     while True:
         event_was_set = _full_recheck_needed_event.wait(timeout=MONITORING_INTERVAL)
         if event_was_set:
-            logging.info("--- Event triggered (healthy proxies < N). Starting full re-check... ---")
+            logging.info("--- Emergency threshold breached. Starting full re-check audit... ---")
             _full_recheck_needed_event.clear()
         else:
-            logging.info(f"--- Periodic interval ({MONITORING_INTERVAL}s) reached. Starting full re-check... ---")
+            logging.info(f"--- Periodic interval ({MONITORING_INTERVAL}s) reached. Starting fallback re-check audit... ---")
         _run_full_check_cycle()
 
-    for controller in controllers:
+    for controller in controllers.values():
         try:
             controller.close()
         except Exception:
@@ -233,6 +243,7 @@ def handle_client_connection(client_socket, client_address):
     """Handles a single client connection by forwarding it through a selected SOCKS5 proxy."""
     logging.info(f"Accepted connection from {client_address}")
     proxy_socket = None
+    upstream_proxy = None
 
     try:
         upstream_proxy = select_proxy_round_robin()
@@ -282,7 +293,7 @@ def handle_client_connection(client_socket, client_address):
         proxy_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         proxy_socket.settimeout(10)
         proxy_socket.connect((upstream_host, upstream_port))
-        proxy_socket.sendall(b'\x05\x01\x00') # Handshake with upstream
+        proxy_socket.sendall(b'\x05\x01\x00')
         server_choice = proxy_socket.recv(2)
         if not server_choice or server_choice[0] != 0x05 or server_choice[1] != 0x00:
             raise socks.SOCKS5Error("Upstream proxy auth failed")
@@ -298,23 +309,25 @@ def handle_client_connection(client_socket, client_address):
         client_socket.sendall(proxy_reply_header)
         reply_atyp = proxy_reply_header[3]
         bnd_len = 0
-        if reply_atyp == 0x01: bnd_len = 4 + 2 # IPv4 + port
-        elif reply_atyp == 0x04: bnd_len = 16 + 2 # IPv6 + port
+        if reply_atyp == 0x01: bnd_len = 4 + 2
+        elif reply_atyp == 0x04: bnd_len = 16 + 2
         elif reply_atyp == 0x03:
             len_byte = proxy_socket.recv(1)
             client_socket.sendall(len_byte)
-            bnd_len = len_byte[0] + 2 # domain + port
-        # Relay the rest of the bind address and port
+            bnd_len = len_byte[0] + 2
+        
         bnd_full = proxy_socket.recv(bnd_len)
         client_socket.sendall(bnd_full)
 
-        # Relay data if connection was successful
         if proxy_reply_header[1] == 0x00:
             logging.info(f"SOCKS connection established for {client_address}. Relaying data.")
             relay_data(client_socket, proxy_socket, client_address)
 
     except (socket.error, socks.SOCKS5Error, BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as e:
-        logging.error(f"Error during SOCKS relay for {client_address}: {e}")
+        logging.error(f"Error during SOCKS relay for {client_address} via {upstream_proxy}: {e}")
+        if upstream_proxy:
+            trigger_reactive_removal(upstream_proxy, "SOCKS FAILURE")
+        
         if not client_socket._closed:
             try:
                 client_socket.sendall(b'\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00')
@@ -367,7 +380,7 @@ def start_server(listen_host, listen_port):
         server_socket.listen(128)
         logging.info(f"Custom LB SOCKS5 Proxy listening on {listen_host}:{listen_port}")
         logging.info(f"Strategy: Round-robin on top {TOP_N_PROXIES} proxies.")
-        logging.info("Full re-check triggered periodically or if healthy proxies < N.")
+        logging.info("Triggers: SOCKS Failure, GUARD DOWN, BOOTSTRAP RESTART")
     except socket.error as e:
         logging.error(f"Failed to bind or listen on {listen_host}:{listen_port}: {e}")
         return
@@ -423,8 +436,6 @@ if __name__ == "__main__":
     monitor_thread = threading.Thread(target=monitor_proxies, args=(args.tor_control_password,), daemon=True)
     monitor_thread.start()
 
-    logging.info("Waiting up to 5 minutes for the initial health check to complete...")
-    time.sleep(5 * 60)
     with _shared_state_lock:
         if not _top_proxies:
             logging.warning("Initial health check found no working proxies. Starting server anyway.")
