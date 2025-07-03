@@ -6,6 +6,7 @@ import logging
 import argparse
 import socks
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial # <-- IMPORTED
 import stem
 import stem.control
 import stem.response
@@ -179,6 +180,31 @@ def _run_full_check_cycle():
     _update_proxy_lists(health_data)
     logging.info("--- Full health check audit complete. ---")
 
+# --- REWORKED EVENT HANDLERS ---
+def generic_guard_handler(proxy_tuple, event):
+    """Generic handler for GUARD events, with proxy context pre-filled."""
+    if event.status in [GuardStatus.DOWN, GuardStatus.UNUSABLE]:
+        logging.info(f"Proxy {proxy_tuple} reported guard status: {event.status}. Triggering removal.")
+        trigger_reactive_removal(proxy_tuple, f"GUARD {event.status}")
+
+def generic_status_handler(proxy_tuple, controller, event):
+    """Generic handler for STATUS_CLIENT events, with proxy context pre-filled."""
+    if event.action == "BOOTSTRAP":
+        try:
+            if not is_bootstrapped(controller):
+                progress = event.arguments.get('PROGRESS', 'N/A')
+                logging.info(f"Proxy {proxy_tuple} is re-bootstrapping (progress {progress}%). Verifying with getinfo confirmed non-bootstrapped state.")
+                trigger_reactive_removal(proxy_tuple, f"BOOTSTRAP RESTART (progress {progress}%)")
+        except stem.SocketError:
+            logging.error(f"Control socket for {proxy_tuple} died during status check. Removing.")
+            trigger_reactive_removal(proxy_tuple, "CONTROL PORT DISCONNECTED")
+        except Exception as e:
+            logging.error(f"Error checking bootstrap status for {proxy_tuple} during event: {e}")
+            trigger_reactive_removal(proxy_tuple, "CONTROL PORT ERROR")
+    
+    elif event.action == "NETWORK_LIVENESS" and event.arguments.get("LIVENESS") == "down":
+        logging.warning(f"Proxy {proxy_tuple} reported network is down. Triggering removal.")
+        trigger_reactive_removal(proxy_tuple, "NETWORK LIVENESS DOWN")
 
 def monitor_proxies(bootstrapped_controllers):
     """
@@ -193,41 +219,19 @@ def monitor_proxies(bootstrapped_controllers):
         logging.error(f"Invalid CHECK_MODE '{CHECK_MODE}'. Monitor thread exiting.")
         return
 
-    # --- Set up event listeners ---
-    # Create a reverse map from controller object to its (host, port) tuple
-    controller_to_proxy_map = {c: p for p, c in bootstrapped_controllers.items()}
-
-    def guard_event_handler(event):
-        proxy_tuple = controller_to_proxy_map.get(event.controller)
-        if not proxy_tuple: return
-        if event.status == GuardStatus.DOWN:
-            trigger_reactive_removal(proxy_tuple, "GUARD DOWN")
-
-    def status_event_handler(event):
-        proxy_tuple = controller_to_proxy_map.get(event.controller)
-        if not proxy_tuple: return
+    # --- REWORKED LISTENER REGISTRATION ---
+    # Use functools.partial to create specialized callbacks for each controller.
+    # Each callback will have the 'proxy_tuple' and 'controller' arguments pre-filled.
+    for proxy_tuple, controller in bootstrapped_controllers.items():
+        # Create a guard handler that knows its proxy_tuple
+        guard_handler = partial(generic_guard_handler, proxy_tuple)
         
-        # A BOOTSTRAP action within a STATUS_CLIENT event indicates a change in
-        # bootstrap state. We will query the authoritative status via getinfo.
-        if event.action == "BOOTSTRAP":
-            controller = event.controller
-            try:
-                # Use the existing is_bootstrapped helper to query via getinfo
-                if not is_bootstrapped(controller):
-                    progress = event.arguments.get('PROGRESS', 'N/A')
-                    logging.info(f"Proxy {proxy_tuple} is re-bootstrapping (progress {progress}%). Verifying with getinfo confirmed non-bootstrapped state.")
-                    trigger_reactive_removal(proxy_tuple, f"BOOTSTRAP RESTART (progress {progress}%)")
-            except stem.SocketError:
-                logging.error(f"Control socket for {proxy_tuple} died during status check. Removing.")
-                trigger_reactive_removal(proxy_tuple, "CONTROL PORT DISCONNECTED")
-            except Exception as e:
-                logging.error(f"Error checking bootstrap status for {proxy_tuple} during event: {e}")
-                trigger_reactive_removal(proxy_tuple, "CONTROL PORT ERROR")
+        # Create a status handler that knows its proxy_tuple AND its controller
+        status_handler = partial(generic_status_handler, proxy_tuple, controller)
 
-    for controller in bootstrapped_controllers.values():
-        controller.add_event_listener(guard_event_handler, EventType.GUARD)
-        controller.add_event_listener(status_event_handler, EventType.STATUS_CLIENT)
-        logging.info(f"Event listeners added for {controller_to_proxy_map[controller]}")
+        controller.add_event_listener(guard_handler, EventType.GUARD)
+        controller.add_event_listener(status_handler, EventType.STATUS_CLIENT)
+        logging.info(f"Event listeners added for {proxy_tuple}")
 
     while True:
         event_was_set = _full_recheck_needed_event.wait(timeout=MONITORING_INTERVAL)
