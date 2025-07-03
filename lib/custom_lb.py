@@ -8,7 +8,9 @@ import socks
 from concurrent.futures import ThreadPoolExecutor
 import stem
 import stem.control
-from stem import EventType, GuardStatus, StatusType
+import stem.response
+from stem import CircStatus, GuardStatus, StatusType
+from stem.control import EventType
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s')
@@ -152,66 +154,80 @@ def _update_proxy_lists(health_data):
         _top_proxies = new_top_proxies
         logging.info(f"Full list of healthy proxies updated ({len(_healthy_sorted_proxies)} total): {_healthy_sorted_proxies}")
 
-def monitor_proxies(control_password):
-    """
-    Monitors proxy health. Reacts to SOCKS failures, GUARD events, and STATUS
-    events, with a periodic check as a fallback.
-    """
+def _run_full_check_cycle():
+    """Performs a health check on all target proxies and updates the global lists."""
     if CHECK_MODE == 0:
         check_func = check_proxy_ping_health
-        MONITORING_INTERVAL = PING_MONITORING_INTERVAL
     elif CHECK_MODE == 1:
         check_func = check_proxy_download_health
+    else:
+        logging.error(f"Invalid CHECK_MODE '{CHECK_MODE}'. Cannot run check cycle.")
+        return
+
+    health_data = {}
+    if not _target_proxies:
+        logging.warning("Monitor: No target proxies configured.")
+        return
+
+    logging.info(f"Starting full health check audit on all target proxies: {_target_proxies}")
+    for host, port in _target_proxies:
+        try:
+            performance_metric = check_func(host, port)
+            health_data[(host, port)] = performance_metric
+        except Exception as e:
+            logging.error(f"Error during health check for proxy {host}:{port}: {e}", exc_info=False)
+    _update_proxy_lists(health_data)
+    logging.info("--- Full health check audit complete. ---")
+
+
+def monitor_proxies(bootstrapped_controllers):
+    """
+    Monitors proxy health. Reacts to GUARD and STATUS events, with a periodic check as a fallback.
+    Receives a dictionary of pre-connected and authenticated controllers.
+    """
+    if CHECK_MODE == 0:
+        MONITORING_INTERVAL = PING_MONITORING_INTERVAL
+    elif CHECK_MODE == 1:
         MONITORING_INTERVAL = DOWNLOAD_MONITORING_INTERVAL
     else:
         logging.error(f"Invalid CHECK_MODE '{CHECK_MODE}'. Monitor thread exiting.")
         return
 
-    def _run_full_check_cycle():
-        health_data = {}
-        if not _target_proxies:
-            logging.warning("Monitor: No target proxies configured.")
-            return
-
-        logging.info(f"Starting full health check audit on all target proxies: {_target_proxies}")
-        for host, port in _target_proxies:
-            try:
-                performance_metric = check_func(host, port)
-                health_data[(host, port)] = performance_metric
-            except Exception as e:
-                logging.error(f"Error during health check for proxy {host}:{port}: {e}", exc_info=False)
-        _update_proxy_lists(health_data)
-        logging.info("--- Full health check audit complete. ---")
-
-    # Initial check to populate lists before starting
-    _run_full_check_cycle()
-
     # --- Set up event listeners ---
-    controllers = {} # Use a dictionary to map controller back to proxy
-    for host, port in _target_proxies:
-        try:
-            controller = stem.control.Controller.from_port(address=host, port=get_control_port(port))
-            controller.authenticate(password=control_password)
-            controllers[controller] = (host, port)
-            logging.info(f"Successfully connected to Tor control for {host}:{port}.")
-        except Exception as e:
-            logging.warning(f"Failed to connect/auth with Tor control for {host}:{port}: {e}.")
+    # Create a reverse map from controller object to its (host, port) tuple
+    controller_to_proxy_map = {c: p for p, c in bootstrapped_controllers.items()}
 
     def guard_event_handler(event):
-        proxy_tuple = controllers.get(event.controller)
+        proxy_tuple = controller_to_proxy_map.get(event.controller)
         if not proxy_tuple: return
         if event.status == GuardStatus.DOWN:
             trigger_reactive_removal(proxy_tuple, "GUARD DOWN")
 
     def status_event_handler(event):
-        proxy_tuple = controllers.get(event.controller)
+        proxy_tuple = controller_to_proxy_map.get(event.controller)
         if not proxy_tuple: return
-        if event.action == "BOOTSTRAP_STATUS" and event.arguments.get('PROGRESS', '100') != '100':
-            trigger_reactive_removal(proxy_tuple, "BOOTSTRAP RESTART")
+        
+        # A BOOTSTRAP action within a STATUS_CLIENT event indicates a change in
+        # bootstrap state. We will query the authoritative status via getinfo.
+        if event.action == "BOOTSTRAP":
+            controller = event.controller
+            try:
+                # Use the existing is_bootstrapped helper to query via getinfo
+                if not is_bootstrapped(controller):
+                    progress = event.arguments.get('PROGRESS', 'N/A')
+                    logging.info(f"Proxy {proxy_tuple} is re-bootstrapping (progress {progress}%). Verifying with getinfo confirmed non-bootstrapped state.")
+                    trigger_reactive_removal(proxy_tuple, f"BOOTSTRAP RESTART (progress {progress}%)")
+            except stem.SocketError:
+                logging.error(f"Control socket for {proxy_tuple} died during status check. Removing.")
+                trigger_reactive_removal(proxy_tuple, "CONTROL PORT DISCONNECTED")
+            except Exception as e:
+                logging.error(f"Error checking bootstrap status for {proxy_tuple} during event: {e}")
+                trigger_reactive_removal(proxy_tuple, "CONTROL PORT ERROR")
 
-    for controller in controllers.keys():
+    for controller in bootstrapped_controllers.values():
         controller.add_event_listener(guard_event_handler, EventType.GUARD)
         controller.add_event_listener(status_event_handler, EventType.STATUS_CLIENT)
+        logging.info(f"Event listeners added for {controller_to_proxy_map[controller]}")
 
     while True:
         event_was_set = _full_recheck_needed_event.wait(timeout=MONITORING_INTERVAL)
@@ -222,7 +238,7 @@ def monitor_proxies(control_password):
             logging.info(f"--- Periodic interval ({MONITORING_INTERVAL}s) reached. Starting fallback re-check audit... ---")
         _run_full_check_cycle()
 
-    for controller in controllers.values():
+    for controller in bootstrapped_controllers.values():
         try:
             controller.close()
         except Exception:
@@ -397,6 +413,71 @@ def start_server(listen_host, listen_port):
             logging.error(f"Socket error during accept: {e}")
     server_socket.close()
 
+def is_bootstrapped(controller):
+    """Checks if a Tor instance is fully bootstrapped by querying its control port."""
+    try:
+        response = controller.get_info("status/bootstrap-phase")
+        # Use stem's response parser, similar to the example code.
+        status = stem.response.ControlLine(response)
+        while not status.is_empty():
+            if status.is_next_mapping():
+                key, value = status.pop_mapping(quoted=status.is_next_quoted())
+                if key == "PROGRESS" and int(value) == 100:
+                    return True
+            else:
+                # Discard other parts of the line we don't care about.
+                status.pop(quoted=status.is_next_quoted())
+    except (stem.InvalidResponse, ValueError) as e:
+        logging.error(f"Error parsing bootstrap status for {controller.get_socket().getpeername()}: {e}")
+    except stem.SocketError:
+        # Re-raise socket errors to be handled by the caller.
+        raise
+    except Exception as e:
+        logging.error(f"Unexpected error checking bootstrap status for {controller.get_socket().getpeername()}: {e}")
+    return False
+
+def wait_for_all_to_bootstrap(target_proxies, control_password):
+    """
+    Connects to all Tor controllers and waits until each one reports 100%
+    bootstrap progress. Returns a dict of connected controllers.
+    """
+    logging.info("Waiting for all Tor instances to initialize and bootstrap...")
+    bootstrapped_controllers = {}
+    proxies_to_check = set(target_proxies)
+
+    while proxies_to_check:
+        newly_bootstrapped_proxies = set()
+        for proxy_tuple in proxies_to_check:
+            host, port = proxy_tuple
+            controller = bootstrapped_controllers.get(proxy_tuple)
+
+            try:
+                # If we don't have a controller, try to establish one.
+                if not controller or not controller.is_alive():
+                    controller = stem.control.Controller.from_port(address=host, port=get_control_port(port))
+                    controller.authenticate(password=control_password)
+                    bootstrapped_controllers[proxy_tuple] = controller
+                    logging.info(f"Successfully connected to Tor control for {proxy_tuple}.")
+                
+                # Check the bootstrap status.
+                if is_bootstrapped(controller):
+                    newly_bootstrapped_proxies.add(proxy_tuple)
+
+            except Exception as e:
+                logging.warning(f"Cannot connect/check {proxy_tuple} for bootstrap status: {e}. Will retry.")
+        
+        if newly_bootstrapped_proxies:
+            proxies_to_check -= newly_bootstrapped_proxies
+            for p in newly_bootstrapped_proxies:
+                 logging.info(f"Proxy {p} is fully bootstrapped.")
+        
+        if proxies_to_check:
+            logging.info(f"Still waiting for {len(proxies_to_check)} proxies to bootstrap: {list(proxies_to_check)}")
+            time.sleep(10) # Wait before re-polling remaining proxies.
+
+    logging.info("All target Tor instances are bootstrapped.")
+    return bootstrapped_controllers
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Custom SOCKS5 Load Balancer for Tor with advanced health checks.")
     parser.add_argument("--listen-host", type=str, required=True, help="Host to listen on")
@@ -430,10 +511,19 @@ if __name__ == "__main__":
 
     CHECK_MODE = args.check_mode
 
-    logging.info("Waiting 10 minutes for Tor instances to initialize...")
-    time.sleep(10 * 60)
+    # Wait a minute for the Tor processes to start up before connecting.
+    logging.info("Waiting 1 minute for Tor processes to start up...")
+    time.sleep(60)
 
-    monitor_thread = threading.Thread(target=monitor_proxies, args=(args.tor_control_password,), daemon=True)
+    # Wait for all Tor instances to bootstrap before starting.
+    controllers = wait_for_all_to_bootstrap(_target_proxies, args.tor_control_password)
+
+    # Run the first health check to populate proxy lists before serving traffic.
+    logging.info("All proxies bootstrapped. Performing initial health check...")
+    _run_full_check_cycle()
+
+    # Start the monitor thread with the already connected controllers.
+    monitor_thread = threading.Thread(target=monitor_proxies, args=(controllers,), daemon=True)
     monitor_thread.start()
 
     with _shared_state_lock:
