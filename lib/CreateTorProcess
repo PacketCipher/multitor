@@ -57,6 +57,7 @@ function CreateTorProcess() {
     echo "ControlPort ${_arg_control}"
     echo "PidFile ${_proc_dir}/${_arg_socks}.pid"
     echo "DataDirectory ${_proc_dir}"
+    echo "Log notice file /var/log/tor/notices_${_arg_socks}.log"
   } >> "${_torrc_config}"
   _kstate="$?"
 
