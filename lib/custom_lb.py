@@ -33,7 +33,7 @@ _full_recheck_needed_event = threading.Event()
 
 # --- CONSTANTS for health checks ---
 PING_MONITORING_INTERVAL = 1 * 60 * 60
-DOWNLOAD_MONITORING_INTERVAL = 12 * 60 * 60
+DOWNLOAD_MONITORING_INTERVAL = 4 * 60 * 60
 
 def check_proxy_ping_health(proxy_host, proxy_port, num_rounds=10, requests_per_round=10):
     """Measures proxy performance by running multiple rounds of parallel requests."""
@@ -78,7 +78,7 @@ def check_proxy_ping_health(proxy_host, proxy_port, num_rounds=10, requests_per_
 
 def check_proxy_download_health(proxy_host, proxy_port, num_downloads=1):
     """Measures the average time it takes to download a test file via a proxy."""
-    DOWNLOAD_URL = "https://proof.ovh.net/files/10Mb.dat"
+    DOWNLOAD_URL = "https://proof.ovh.net/files/1Mb.dat"
     DOWNLOAD_TIMEOUT = 30 # in seconds
 
     logging.info(f"--- Starting Download Time Test for {proxy_host}:{proxy_port} ---")
