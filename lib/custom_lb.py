@@ -486,6 +486,8 @@ def wait_for_all_to_bootstrap(target_proxies, control_password):
     bootstrapped_controllers = {}
     proxies_to_check = set(target_proxies)
 
+    start_time = time.time()
+    
     while proxies_to_check:
         newly_bootstrapped_proxies = set()
         for proxy_tuple in proxies_to_check:
@@ -515,6 +517,10 @@ def wait_for_all_to_bootstrap(target_proxies, control_password):
         if proxies_to_check:
             logging.info(f"Still waiting for {len(proxies_to_check)} proxies to bootstrap: {list(proxies_to_check)}")
             time.sleep(10) # Wait before re-polling remaining proxies.
+        
+        current_time = time.time()
+        if current_time - start_time > 30 * 60:
+            break
 
     logging.info("All target Tor instances are bootstrapped.")
     return bootstrapped_controllers
