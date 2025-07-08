@@ -80,6 +80,7 @@ def check_proxy_download_health(proxy_host, proxy_port, num_downloads=1):
     """Measures the average time it takes to download a test file via a proxy."""
     DOWNLOAD_URL = "https://proof.ovh.net/files/10Mb.dat"
     DOWNLOAD_TIMEOUT = 30 # in seconds
+    DOWNLOAD_TIMEOUT_PENALTY = 99999
 
     logging.info(f"--- Starting Download Time Test for {proxy_host}:{proxy_port} ---")
     session = requests.Session()
@@ -96,8 +97,8 @@ def check_proxy_download_health(proxy_host, proxy_port, num_downloads=1):
             duration = time.time() - start_time
             all_durations.append(duration)
         except requests.exceptions.RequestException:
-            all_durations.append(DOWNLOAD_TIMEOUT)
-    overall_avg_time = sum(all_durations) / len(all_durations) if all_durations else DOWNLOAD_TIMEOUT
+            all_durations.append(DOWNLOAD_TIMEOUT_PENALTY)
+    overall_avg_time = sum(all_durations) / len(all_durations) if all_durations else DOWNLOAD_TIMEOUT_PENALTY
     logging.info(f"--- Download Test Summary for {proxy_host}:{proxy_port}: Avg time {overall_avg_time:.2f}s ---")
     return overall_avg_time
 
