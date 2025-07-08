@@ -12,6 +12,7 @@ import stem.control
 import stem.response
 from stem import CircStatus, GuardStatus, StatusType
 from stem.control import EventType
+import statistics
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s')
@@ -39,6 +40,7 @@ def check_proxy_ping_health(proxy_host, proxy_port, num_rounds=10, requests_per_
     """Measures proxy performance by running multiple rounds of parallel requests."""
     TEST_URL = "http://connectivitycheck.gstatic.com/generate_204"
     HEALTH_CHECK_TIMEOUT = 5 # seconds
+    HEALTH_CHECK_TIMEOUT_PENALTY = 99999
 
     total_requests = num_rounds * requests_per_round
     logging.info(
@@ -57,24 +59,25 @@ def check_proxy_ping_health(proxy_host, proxy_port, num_rounds=10, requests_per_
             end_time = time.time()
             if response.status_code == 204:
                 return end_time - start_time
-            return HEALTH_CHECK_TIMEOUT
+            return HEALTH_CHECK_TIMEOUT_PENALTY
         except requests.exceptions.RequestException:
-            return HEALTH_CHECK_TIMEOUT
+            return HEALTH_CHECK_TIMEOUT_PENALTY
 
     all_latencies = []
     with ThreadPoolExecutor(max_workers=requests_per_round * num_rounds) as executor:
         futures = [executor.submit(_make_single_request) for _ in range(total_requests)]
         all_latencies = [f.result() for f in futures]
 
-    overall_avg_latency = sum(all_latencies) / len(all_latencies) if all_latencies else HEALTH_CHECK_TIMEOUT
-    success_count = sum(1 for lat in all_latencies if lat < HEALTH_CHECK_TIMEOUT)
+    # overall_avg_latency = sum(all_latencies) / len(all_latencies) if all_latencies else HEALTH_CHECK_TIMEOUT_PENALTY
+    overall_avg_latency = statistics.median(all_latencies)
+    success_count = sum(1 for lat in all_latencies if lat < HEALTH_CHECK_TIMEOUT_PENALTY)
     success_rate = (success_count / total_requests) * 100
 
     logging.info(f"--- Performance Test Summary for {proxy_host}:{proxy_port} ---")
     logging.info(f"Successful requests: {success_count}/{total_requests} ({success_rate:.1f}%)")
     logging.info(f"Overall avg latency: {overall_avg_latency:.4f}s (includes penalties)")
     logging.info("---------------------------------")
-    return overall_avg_latency
+    return overall_avg_latency if overall_avg_latency != HEALTH_CHECK_TIMEOUT_PENALTY else None
 
 def check_proxy_download_health(proxy_host, proxy_port, num_downloads=1):
     """Measures the average time it takes to download a test file via a proxy."""
@@ -98,9 +101,11 @@ def check_proxy_download_health(proxy_host, proxy_port, num_downloads=1):
             all_durations.append(duration)
         except requests.exceptions.RequestException:
             all_durations.append(DOWNLOAD_TIMEOUT_PENALTY)
-    overall_avg_time = sum(all_durations) / len(all_durations) if all_durations else DOWNLOAD_TIMEOUT_PENALTY
+    # overall_avg_time = sum(all_durations) / len(all_durations) if all_durations else DOWNLOAD_TIMEOUT_PENALTY
+    overall_avg_time = statistics.median(all_durations)
+
     logging.info(f"--- Download Test Summary for {proxy_host}:{proxy_port}: Avg time {overall_avg_time:.2f}s ---")
-    return overall_avg_time
+    return overall_avg_time if overall_avg_time != DOWNLOAD_TIMEOUT_PENALTY else None
 
 def get_control_port(socks_port):
     """Derives the Tor control port from a SOCKS port."""
@@ -175,7 +180,8 @@ def _run_full_check_cycle():
     for host, port in _target_proxies:
         try:
             performance_metric = check_func(host, port)
-            health_data[(host, port)] = performance_metric
+            if performance_metric is not None:
+                health_data[(host, port)] = performance_metric
         except Exception as e:
             logging.error(f"Error during health check for proxy {host}:{port}: {e}", exc_info=False)
     _update_proxy_lists(health_data)
