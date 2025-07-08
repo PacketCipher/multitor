@@ -6,13 +6,14 @@
 # Function name: CreateTorProcess()
 #
 # Description:
-#   It creates tor processes.
+#   It creates tor processes. It selects torrc templates from a directory
+#   in a round-robin fashion to ensure equal distribution across instances.
 #
 # Usage:
-#   CreateTorProcess "username" "num" "num"
+#   CreateTorProcess "username" "num" "num" "num"
 #
 # Examples:
-#   CreateTorProcess ${user_name} ${socks_port_number} ${control_port_number}
+#   CreateTorProcess ${user_name} ${socks_port_number} ${control_port_number} ${i}
 #
 
 function CreateTorProcess() {
@@ -23,6 +24,7 @@ function CreateTorProcess() {
   local _arg_uname="$1"
   local _arg_socks="$2"
   local _arg_control="$3"
+  local _arg_idx="$4"
 
   # shellcheck disable=SC2154
   local _proc_dir="${_multitor_directory}/${_arg_socks}"
@@ -34,10 +36,38 @@ function CreateTorProcess() {
   # We create a directory for the new tor process.
   CreateTorDirectory
 
-  # shellcheck disable=SC2154
-  local _torrc_template="${_tml}/torrc-template.cfg"
+  # Dynamically select a torrc template for equal distribution.
 
-  # Copy the template to the process-specific torrc file
+  # shellcheck disable=SC2154
+  local _torrc_template_dir="${_tml}/tor"
+  # Get all template files from the directory into an array.
+  # The `shopt -s nullglob` ensures the array is empty if no files match.
+  local _torrc_templates
+  shopt -s nullglob
+  _torrc_templates=( "${_torrc_template_dir}"/* )
+  shopt -u nullglob
+  
+  local _num_templates="${#_torrc_templates[@]}"
+
+  # Check if any templates were found.
+  if [[ ${_num_templates} -eq 0 ]]; then
+    _logger "stop" \
+      "${_FUNCTION_ID}()" \
+      "FATAL: No torrc template files found in ${_torrc_template_dir}/"
+    return 1
+  fi
+
+  # Select a template using the instance index (_arg_idx) and modulo operator.
+  # This ensures a round-robin selection (e.g., 0, 1, 2, 0, 1, 2, ...).
+  local _template_index=$(( _arg_idx % _num_templates ))
+  local _torrc_template="${_torrc_templates[_template_index]}"
+
+  _logger "info" \
+    "${_FUNCTION_ID}()" \
+    "selected template #${_template_index}: ${_torrc_template}"
+
+
+  # Copy the selected template to the process-specific torrc file
   if cp "${_torrc_template}" "${_torrc_config}"; then
     _logger "info" \
       "${_FUNCTION_ID}()" \
@@ -45,13 +75,14 @@ function CreateTorProcess() {
   else
     _logger "stop" \
       "${_FUNCTION_ID}()" \
-      "failed to copy torrc template to ${_torrc_config}"
+      "failed to copy torrc template '${_torrc_template}' to ${_torrc_config}"
     return 1 # Or handle error appropriately
   fi
 
   # Append dynamic configurations
   {
     echo "" # Add a newline for separation
+    echo "# Dynamically added settings"
     echo "HashedControlPassword ${_pass_hash}"
     echo "SocksPort ${_arg_socks}"
     echo "ControlPort ${_arg_control}"

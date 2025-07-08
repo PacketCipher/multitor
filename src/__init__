@@ -79,9 +79,9 @@ function __main__() {
   # Source our custom library files
   # Note: CheckConn (for local port checking) is sourced via _load from src/import
   # shellcheck disable=SC1090,SC1091
-  source "${_lib}/CheckTorHealth"     # For the new internet connectivity health check
+  # source "${_lib}/CheckTorHealth"     # For the new internet connectivity health check
   # shellcheck disable=SC1090,SC1091
-  source "${_lib}/RestartTorInstance" # For restarting Tor instances
+  # source "${_lib}/RestartTorInstance" # For restarting Tor instances
 
 
   # Specifies the call parameters of the script, the exact description
@@ -608,7 +608,7 @@ function __main__() {
         "${_FUNCTION_ID}()" \
         "socks_port_number: '$socks_port_number', control_port_number: '$control_port_number'"
 
-      CreateTorProcess "${user_name}" "${socks_port_number}" "${control_port_number}"
+      CreateTorProcess "${user_name}" "${socks_port_number}" "${control_port_number}" "${i}"
       local _create_status=$?
 
       if [[ $_create_status -eq 0 ]]; then
