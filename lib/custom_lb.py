@@ -557,7 +557,7 @@ def wait_for_all_to_bootstrap(target_proxies, control_password):
             for p in newly_bootstrapped_proxies:
                 logging.info(f"Proxy {p} is fully bootstrapped.")
                 with _shared_state_lock:
-                    _top_proxies = [p]
+                    _top_proxies.append(p)
         
         if proxies_to_check:
             logging.info(f"Still waiting for {len(proxies_to_check)} proxies to bootstrap: {list(proxies_to_check)}")
