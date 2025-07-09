@@ -31,6 +31,10 @@ _round_robin_index = 0
 _target_proxies = []
 # This event is set if the number of healthy proxies drops below N.
 _full_recheck_needed_event = threading.Event()
+# Packet stats
+packet_stats_per_proxy = {}
+packet_stats_n_packets_threshold = 100
+packet_stats_packet_loss_threshold = 0.5
 
 # --- CONSTANTS for health checks ---
 PING_MONITORING_INTERVAL = 1 * 60 * 60
@@ -396,12 +400,16 @@ def handle_client_connection(client_socket, client_address):
             relay_data(client_socket, proxy_socket, client_address)
         else:
             logging.error(f"Upstream SOCKS proxy {upstream_host}:{upstream_port} failed request for {client_address}. REP: {proxy_reply_header[1]}.")
+        
+        packet_stats_per_proxy[upstream_proxy]["Successful"] += 1
 
     except (socket.error, socks.SOCKS5Error, BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as e:
         logging.error(f"Error during SOCKS relay for {client_address} via {upstream_proxy}: {e}")
-        # TODO: Add Packet Success Rate Metric
-        # if upstream_proxy:
-        #     trigger_reactive_removal(upstream_proxy, "SOCKS FAILURE")
+        if upstream_proxy:
+            packet_stats_per_proxy[upstream_proxy]["Failed"] += 1
+            if (packet_stats_per_proxy[upstream_proxy]["Successful"] + packet_stats_per_proxy[upstream_proxy]["Failed"]) > packet_stats_n_packets_threshold:
+                if packet_stats_per_proxy[upstream_proxy]["Failed"] / (packet_stats_per_proxy[upstream_proxy]["Successful"] + packet_stats_per_proxy[upstream_proxy]["Failed"]) > packet_stats_packet_loss_threshold:
+                    trigger_reactive_removal(upstream_proxy, "SOCKS FAILURE")
         
         if not client_socket._closed:
             try:
@@ -578,6 +586,9 @@ if __name__ == "__main__":
     except ValueError as e:
         logging.error(f"Invalid format for --tor-proxies: {args.tor_proxies}. Error: {e}. Exiting.")
         exit(1)
+    
+    for proxy in _target_proxies:
+        packet_stats_per_proxy[proxy] = {"Successful": 0, "Failed": 0}
 
     TOP_N_PROXIES = args.top_n_proxies
     if TOP_N_PROXIES > len(_target_proxies):
