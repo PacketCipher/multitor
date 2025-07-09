@@ -235,6 +235,10 @@ def monitor_proxies():
     logging.info("All proxies bootstrapped. Performing initial health check...")
     _run_full_check_cycle()
 
+    with _shared_state_lock:
+        if not _top_proxies:
+            logging.warning("Initial health check found no working proxies. Starting server anyway.")
+
     # Start Checking
     if CHECK_MODE == 0:
         MONITORING_INTERVAL = PING_MONITORING_INTERVAL
@@ -585,10 +589,6 @@ if __name__ == "__main__":
     # Start the monitor thread with the already connected controllers.
     monitor_thread = threading.Thread(target=monitor_proxies, args=(), daemon=True)
     monitor_thread.start()
-
-    # with _shared_state_lock:
-    #     if not _top_proxies:
-    #         logging.warning("Initial health check found no working proxies. Starting server anyway.")
 
     try:
         start_server(args.listen_host, args.listen_port)
