@@ -261,15 +261,16 @@ def monitor_proxies():
 
     # --- FIXED: Register all three distinct handlers for the correct event types ---
     for proxy_tuple, controller in bootstrapped_controllers.items():
-        guard_handler = partial(generic_guard_handler, proxy_tuple)
+        # guard_handler = partial(generic_guard_handler, proxy_tuple)
         status_handler = partial(generic_status_handler, proxy_tuple)
         liveness_handler = partial(network_liveness_handler, proxy_tuple)
 
         try:
-            controller.add_event_listener(guard_handler, EventType.GUARD)
+            # controller.add_event_listener(guard_handler, EventType.GUARD)
             controller.add_event_listener(status_handler, EventType.STATUS_CLIENT)
             controller.add_event_listener(liveness_handler, EventType.NETWORK_LIVENESS)
-            logging.info(f"Event listeners (GUARD, STATUS_CLIENT, NETWORK_LIVENESS) added for {proxy_tuple}")
+            # logging.info(f"Event listeners (GUARD, STATUS_CLIENT, NETWORK_LIVENESS) added for {proxy_tuple}")
+            logging.info(f"Event listeners (STATUS_CLIENT, NETWORK_LIVENESS) added for {proxy_tuple}")
         except Exception as e:
             logging.error(f"Failed to add event listeners for {proxy_tuple}: {e}")
 
