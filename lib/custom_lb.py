@@ -418,6 +418,7 @@ def handle_client_connection(client_socket, client_address):
             if (packet_stats_per_proxy[upstream_proxy]["Successful"] + packet_stats_per_proxy[upstream_proxy]["Failed"]) > packet_stats_n_packets_threshold:
                 if packet_stats_per_proxy[upstream_proxy]["Failed"] / (packet_stats_per_proxy[upstream_proxy]["Successful"] + packet_stats_per_proxy[upstream_proxy]["Failed"]) > packet_stats_packet_loss_threshold:
                     trigger_reactive_removal(upstream_proxy, "SOCKS FAILURE")
+                    packet_stats_per_proxy[upstream_proxy] = {"Successful": 0, "Failed": 0}
         
         if not client_socket._closed:
             try:
