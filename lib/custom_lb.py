@@ -12,7 +12,7 @@ import stem.control
 import stem.response
 from stem import CircStatus, GuardStatus, StatusType
 from stem.control import EventType
-from stem.signal import Signal
+from stem import Signal
 import statistics
 
 # Configure logging
@@ -142,7 +142,7 @@ def trigger_reactive_removal(proxy_tuple, reason):
                 _full_recheck_needed_event.set()
             
             controller = bootstrapped_controllers[proxy_tuple]
-            controller.signal(Signal.RELOAD)
+            controller.signal(Signal.HUP)
             logging.info(f"Tor Reloaded For {proxy_tuple}")
         else:
             logging.info(f"Reactive trigger for {proxy_tuple} ignored as it was already removed.")
