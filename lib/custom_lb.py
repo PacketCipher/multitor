@@ -137,7 +137,7 @@ def trigger_reactive_removal(proxy_tuple, reason):
                 logging.info(f"Top-N list updated due to removal. New list: {new_top_proxies}")
 
             # Conditionally trigger a full re-check
-            if len(_healthy_sorted_proxies) < TOP_N_PROXIES:
+            if len(_healthy_sorted_proxies) <= TOP_N_PROXIES:
                 logging.error(f"Healthy proxies ({len(_healthy_sorted_proxies)}) dropped below threshold ({TOP_N_PROXIES}). Triggering emergency re-check.")
                 _full_recheck_needed_event.set()
             
@@ -261,16 +261,15 @@ def monitor_proxies():
 
     # --- FIXED: Register all three distinct handlers for the correct event types ---
     for proxy_tuple, controller in bootstrapped_controllers.items():
-        # guard_handler = partial(generic_guard_handler, proxy_tuple)
+        guard_handler = partial(generic_guard_handler, proxy_tuple)
         status_handler = partial(generic_status_handler, proxy_tuple)
         liveness_handler = partial(network_liveness_handler, proxy_tuple)
 
         try:
-            # controller.add_event_listener(guard_handler, EventType.GUARD)
+            controller.add_event_listener(guard_handler, EventType.GUARD)
             controller.add_event_listener(status_handler, EventType.STATUS_CLIENT)
             controller.add_event_listener(liveness_handler, EventType.NETWORK_LIVENESS)
-            # logging.info(f"Event listeners (GUARD, STATUS_CLIENT, NETWORK_LIVENESS) added for {proxy_tuple}")
-            logging.info(f"Event listeners (STATUS_CLIENT, NETWORK_LIVENESS) added for {proxy_tuple}")
+            logging.info(f"Event listeners (GUARD, STATUS_CLIENT, NETWORK_LIVENESS) added for {proxy_tuple}")
         except Exception as e:
             logging.error(f"Failed to add event listeners for {proxy_tuple}: {e}")
 
