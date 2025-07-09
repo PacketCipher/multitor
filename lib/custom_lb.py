@@ -565,6 +565,10 @@ def wait_for_all_to_bootstrap(target_proxies, control_password):
         
         current_time = time.time()
         if current_time - start_time > 30 * 60:
+            for proxy_tuple in proxies_to_check:
+                # Free-Up Memory & CPU #
+                controller = bootstrapped_controllers[proxy_tuple]
+                controller.signal(Signal.SHUTDOWN)
             break
 
     logging.info("All target Tor instances are bootstrapped.")
