@@ -218,11 +218,24 @@ def network_liveness_handler(proxy_tuple, event):
         logging.warning(f"Proxy {proxy_tuple} reported network is DOWN. Triggering removal.")
         trigger_reactive_removal(proxy_tuple, "NETWORK LIVENESS DOWN")
 
-def monitor_proxies(bootstrapped_controllers):
+def monitor_proxies():
     """
     Monitors proxy health. Reacts to GUARD, STATUS, and NETWORK_LIVENESS events,
     with a periodic check as a fallback.
     """
+
+    # Wait a minute for the Tor processes to start up before connecting.
+    logging.info("Waiting 1 minute for Tor processes to start up...")
+    time.sleep(60)
+
+    # Wait for all Tor instances to bootstrap before starting.
+    bootstrapped_controllers = wait_for_all_to_bootstrap(_target_proxies, args.tor_control_password)
+
+    # Run the first health check to populate proxy lists before serving traffic.
+    logging.info("All proxies bootstrapped. Performing initial health check...")
+    _run_full_check_cycle()
+
+    # Start Checking
     if CHECK_MODE == 0:
         MONITORING_INTERVAL = PING_MONITORING_INTERVAL
     elif CHECK_MODE == 1:
@@ -489,6 +502,8 @@ def wait_for_all_to_bootstrap(target_proxies, control_password):
     Connects to all Tor controllers and waits until each one reports 100%
     bootstrap progress. Returns a dict of connected controllers.
     """
+    global _top_proxies
+
     logging.info("Waiting for all Tor instances to initialize and bootstrap...")
     bootstrapped_controllers = {}
     proxies_to_check = set(target_proxies)
@@ -519,7 +534,9 @@ def wait_for_all_to_bootstrap(target_proxies, control_password):
         if newly_bootstrapped_proxies:
             proxies_to_check -= newly_bootstrapped_proxies
             for p in newly_bootstrapped_proxies:
-                 logging.info(f"Proxy {p} is fully bootstrapped.")
+                logging.info(f"Proxy {p} is fully bootstrapped.")
+                with _shared_state_lock:
+                    _top_proxies = [(host, port)]
         
         if proxies_to_check:
             logging.info(f"Still waiting for {len(proxies_to_check)} proxies to bootstrap: {list(proxies_to_check)}")
@@ -565,24 +582,13 @@ if __name__ == "__main__":
 
     CHECK_MODE = args.check_mode
 
-    # Wait a minute for the Tor processes to start up before connecting.
-    logging.info("Waiting 1 minute for Tor processes to start up...")
-    time.sleep(60)
-
-    # Wait for all Tor instances to bootstrap before starting.
-    controllers = wait_for_all_to_bootstrap(_target_proxies, args.tor_control_password)
-
-    # Run the first health check to populate proxy lists before serving traffic.
-    logging.info("All proxies bootstrapped. Performing initial health check...")
-    _run_full_check_cycle()
-
     # Start the monitor thread with the already connected controllers.
-    monitor_thread = threading.Thread(target=monitor_proxies, args=(controllers,), daemon=True)
+    monitor_thread = threading.Thread(target=monitor_proxies, args=(), daemon=True)
     monitor_thread.start()
 
-    with _shared_state_lock:
-        if not _top_proxies:
-            logging.warning("Initial health check found no working proxies. Starting server anyway.")
+    # with _shared_state_lock:
+    #     if not _top_proxies:
+    #         logging.warning("Initial health check found no working proxies. Starting server anyway.")
 
     try:
         start_server(args.listen_host, args.listen_port)
