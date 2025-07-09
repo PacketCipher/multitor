@@ -12,6 +12,7 @@ import stem.control
 import stem.response
 from stem import CircStatus, GuardStatus, StatusType
 from stem.control import EventType
+from stem.signal import Signal
 import statistics
 
 # Configure logging
@@ -20,6 +21,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # --- Shared state and trigger mechanism ---
 TOP_N_PROXIES = None
 CHECK_MODE = None
+bootstrapped_controllers = None
 _shared_state_lock = threading.Lock()
 # Master list of ALL healthy proxies, sorted by performance (best first).
 _healthy_sorted_proxies = []
@@ -138,6 +140,10 @@ def trigger_reactive_removal(proxy_tuple, reason):
             if len(_healthy_sorted_proxies) < TOP_N_PROXIES:
                 logging.error(f"Healthy proxies ({len(_healthy_sorted_proxies)}) dropped below threshold ({TOP_N_PROXIES}). Triggering emergency re-check.")
                 _full_recheck_needed_event.set()
+            
+            controller = bootstrapped_controllers[proxy_tuple]
+            controller.signal(Signal.RELOAD)
+            logging.info(f"Tor Reloaded For {proxy_tuple}")
         else:
             logging.info(f"Reactive trigger for {proxy_tuple} ignored as it was already removed.")
 
@@ -227,6 +233,7 @@ def monitor_proxies():
     Monitors proxy health. Reacts to GUARD, STATUS, and NETWORK_LIVENESS events,
     with a periodic check as a fallback.
     """
+    global bootstrapped_controllers
 
     # Wait a minute for the Tor processes to start up before connecting.
     logging.info("Waiting 1 minute for Tor processes to start up...")
@@ -401,7 +408,8 @@ def handle_client_connection(client_socket, client_address):
         else:
             logging.error(f"Upstream SOCKS proxy {upstream_host}:{upstream_port} failed request for {client_address}. REP: {proxy_reply_header[1]}.")
         
-        packet_stats_per_proxy[upstream_proxy]["Successful"] += 1
+        if upstream_proxy:
+            packet_stats_per_proxy[upstream_proxy]["Successful"] += 1
 
     except (socket.error, socks.SOCKS5Error, BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as e:
         logging.error(f"Error during SOCKS relay for {client_address} via {upstream_proxy}: {e}")
