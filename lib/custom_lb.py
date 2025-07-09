@@ -87,7 +87,7 @@ def check_proxy_ping_health(proxy_host, proxy_port, num_rounds=10, requests_per_
 
 def check_proxy_download_health(proxy_host, proxy_port, num_downloads=1):
     """Measures the average time it takes to download a test file via a proxy."""
-    DOWNLOAD_URL = "https://proof.ovh.net/files/10Mb.dat"
+    DOWNLOAD_URL = "https://proof.ovh.net/files/1Mb.dat"
     DOWNLOAD_TIMEOUT = 30 # in seconds
     DOWNLOAD_TIMEOUT_PENALTY = 99999
 
@@ -569,6 +569,7 @@ def wait_for_all_to_bootstrap(target_proxies, control_password):
                 # Free-Up Memory & CPU #
                 controller = bootstrapped_controllers[proxy_tuple]
                 controller.signal(Signal.SHUTDOWN)
+                target_proxies.remove(proxy_tuple)
             break
 
     logging.info("All target Tor instances are bootstrapped.")
