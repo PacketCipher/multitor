@@ -213,8 +213,9 @@ def store_entry_guards(bootstrapped_controllers):
 def generic_guard_handler(proxy_tuple, event):
     """Handles GUARD events. This logic was correct."""
     if event.status in [GuardStatus.DOWN, GuardStatus.BAD]:
-        logging.warning(f"Proxy {proxy_tuple} reported guard status: {event.status}. Triggering removal.")
-        trigger_reactive_removal(proxy_tuple, f"GUARD {event.status}")
+        if event.endpoint_fingerprint == entry_guards[proxy_tuple]:
+            logging.warning(f"Proxy {proxy_tuple} reported guard status: {event.status}. Triggering removal.")
+            trigger_reactive_removal(proxy_tuple, f"GUARD {event.status}")
 
 def generic_status_handler(proxy_tuple, event):
     """
