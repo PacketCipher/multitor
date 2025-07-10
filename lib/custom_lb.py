@@ -19,10 +19,11 @@ import statistics
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s')
 
 # --- Shared state and trigger mechanism ---
+_shared_state_lock = threading.Lock()
 TOP_N_PROXIES = None
 CHECK_MODE = None
 bootstrapped_controllers = None
-_shared_state_lock = threading.Lock()
+entry_guards = {}
 # Master list of ALL healthy proxies, sorted by performance (best first).
 _healthy_sorted_proxies = []
 # The derived list of the top N proxies used for round-robin.
@@ -197,6 +198,17 @@ def _run_full_check_cycle():
     _update_proxy_lists(health_data)
     logging.info("--- Full health check audit complete. ---")
 
+def store_entry_guards(bootstrapped_controllers):
+    for proxy_tuple, controller in bootstrapped_controllers.items():
+        guards = []
+        for circ in sorted(controller.get_circuits()):
+            if circ.status != CircStatus.BUILT:
+                continue
+            guard_fingerprint = circ.path[0][0] # [First Node Of Circuit][Fingerprint]
+            guards.append(guard_fingerprint)
+        most_frequent_guard = max(set(guards), key=guards.count)
+        entry_guards[proxy_tuple] = most_frequent_guard
+
 # --- FIXED & CORRECT EVENT HANDLERS ---
 def generic_guard_handler(proxy_tuple, event):
     """Handles GUARD events. This logic was correct."""
@@ -241,9 +253,12 @@ def monitor_proxies():
 
     # Wait for all Tor instances to bootstrap before starting.
     bootstrapped_controllers = wait_for_all_to_bootstrap(_target_proxies, args.tor_control_password)
-
-    # Run the first health check to populate proxy lists before serving traffic.
     logging.info("All proxies bootstrapped. Performing initial health check...")
+
+    # Store Entry Guards
+    store_entry_guards(bootstrapped_controllers)
+
+    # Run Initial Check
     _run_full_check_cycle()
 
     with _shared_state_lock:
