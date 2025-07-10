@@ -586,6 +586,7 @@ def wait_for_all_to_bootstrap(target_proxies, control_password):
                 controller = bootstrapped_controllers[proxy_tuple]
                 controller.signal(Signal.SHUTDOWN)
                 target_proxies.remove(proxy_tuple)
+                bootstrapped_controllers.pop(proxy_tuple)
             break
 
     logging.info("All target Tor instances are bootstrapped.")
