@@ -256,7 +256,7 @@ def monitor_proxies():
     bootstrapped_controllers = wait_for_all_to_bootstrap(_target_proxies, args.tor_control_password)
     logging.info("All proxies bootstrapped. Performing initial health check...")
 
-    # Store Entry Guards
+    # Store Initial Entry Guards
     store_entry_guards(bootstrapped_controllers)
 
     # Run Initial Check
@@ -297,6 +297,7 @@ def monitor_proxies():
             _full_recheck_needed_event.clear()
         else:
             logging.info(f"--- Periodic interval ({MONITORING_INTERVAL}s) reached. Starting fallback re-check audit... ---")
+        store_entry_guards(bootstrapped_controllers)
         _run_full_check_cycle()
 
     for controller in bootstrapped_controllers.values():
