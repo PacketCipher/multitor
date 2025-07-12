@@ -43,7 +43,7 @@ packet_stats_packet_loss_threshold = 0.5
 PING_MONITORING_INTERVAL = 1 * 60 * 60
 DOWNLOAD_MONITORING_INTERVAL = 12 * 60 * 60
 
-def check_proxy_ping_health(proxy_host, proxy_port, num_rounds=30, requests_per_round=10):
+def check_proxy_ping(proxy_host, proxy_port, num_rounds=10, requests_per_round=10):
     """Measures proxy performance by running multiple rounds of parallel requests."""
     TEST_URL = "http://connectivitycheck.gstatic.com/generate_204"
     HEALTH_CHECK_TIMEOUT = 5 # seconds
@@ -91,7 +91,7 @@ class TotalTimeout(Exception):
     """Custom exception for total download timeout."""
     pass
 
-def check_proxy_download_health(proxy_host, proxy_port, num_downloads=1, total_timeout=200):
+def check_proxy_download_full(proxy_host, proxy_port, num_downloads=1, total_timeout=200):
     """
     Measures the median time it takes to download a test file via a proxy,
     enforcing a total time limit for the download.
@@ -145,6 +145,91 @@ def check_proxy_download_health(proxy_host, proxy_port, num_downloads=1, total_t
     logging.info(f"--- Download Test Summary for {proxy_host}:{proxy_port}: Median time {overall_median_time:.2f}s ---")
     overall_median_time = overall_median_time if overall_median_time < DOWNLOAD_TIMEOUT_PENALTY else None
     return overall_median_time, success_rate
+
+def check_proxy_download_fixed(proxy_host, proxy_port, num_tests=1, test_duration=10):
+    """
+    Measures the median download speed (bytes/sec) through a proxy over a fixed time period.
+
+    Args:
+        proxy_host (str): The hostname or IP address of the proxy server.
+        proxy_port (int): The port number of the proxy server.
+        num_tests (int): The number of times to run the test to calculate a median.
+        test_duration (int): The duration in seconds for each download test.
+
+    Returns:
+        tuple: A tuple containing:
+            - median_speed_bps (float): The median download speed in bytes per second. 
+                                        Returns 0.0 if all tests fail.
+            - success_rate (float): The percentage of successful test runs.
+    """
+    # Use a larger file to ensure the download doesn't finish before the test duration
+    # for most internet speeds.
+    DOWNLOAD_URL = "https://proof.ovh.net/files/100Mb.dat"
+    
+    # A reasonable connect/read timeout for establishing the connection and getting the first byte.
+    # This prevents the initial request from hanging indefinitely.
+    INITIAL_REQUEST_TIMEOUT = (15, 30) # (connect_timeout, read_timeout)
+
+    logging.info(f"--- Starting Download Speed Test for {proxy_host}:{proxy_port} ({num_tests} tests, {test_duration}s each) ---")
+    
+    session = requests.Session()
+    session.proxies = {
+        'http': f'socks5h://{proxy_host}:{proxy_port}',
+        'httpss': f'socks5h://{proxy_host}:{proxy_port}'
+    }
+    
+    all_speeds = []
+
+    for i in range(num_tests):
+        total_bytes_downloaded = 0
+        start_time = time.time()
+        
+        try:
+            # Use stream=True to control the download process chunk by chunk.
+            with session.get(DOWNLOAD_URL, stream=True, timeout=INITIAL_REQUEST_TIMEOUT) as response:
+                response.raise_for_status() # Raise an exception for bad status codes (4xx or 5xx)
+                
+                for chunk in response.iter_content(chunk_size=8192):
+                    if not chunk:
+                        # The download finished before the timer ran out
+                        break
+                        
+                    total_bytes_downloaded += len(chunk)
+                    
+                    # Check if the test duration has been reached
+                    if time.time() - start_time >= test_duration:
+                        break
+            
+            # The download loop finished (either by timeout or completion)
+            actual_duration = time.time() - start_time
+            
+            # Calculate speed in bytes per second. Avoid division by zero.
+            speed_bps = (total_bytes_downloaded / actual_duration) if actual_duration > 0 else 0
+            all_speeds.append(speed_bps)
+
+            # Log results in human-readable format (MB and MB/s)
+            downloaded_mb = total_bytes_downloaded / (1024 * 1024)
+            speed_mbps = speed_bps / (1024 * 1024)
+            logging.info(f"Test {i+1}/{num_tests} success: Downloaded {downloaded_mb:.2f} MB in {actual_duration:.2f}s (Speed: {speed_mbps:.2f} MB/s)")
+
+        except requests.exceptions.RequestException as e:
+            # Catch connection errors, timeouts, etc.
+            logging.warning(f"Test {i+1}/{num_tests} failed: {e}")
+            # A failed test has a speed of 0 bytes/sec
+            all_speeds.append(0.0)
+            
+    # --- Final calculations ---
+    median_speed_bps = statistics.median(all_speeds) if all_speeds else 0.0
+    
+    # A test is considered successful if its speed was greater than 0
+    success_count = sum(1 for speed in all_speeds if speed > 0)
+    success_rate = (success_count / num_tests) * 100 if num_tests > 0 else 0
+
+    median_speed_mbps = median_speed_bps / (1024 * 1024)
+    logging.info(f"--- Speed Test Summary for {proxy_host}:{proxy_port}: Median Speed {median_speed_mbps:.2f} MB/s | Success Rate: {success_rate:.1f}% ---")
+    
+    median_speed_bps = 1 / median_speed_bps # Inverse It For Ascending Sort
+    return median_speed_bps, success_rate
 
 def get_control_port(socks_port):
     """Derives the Tor control port from a SOCKS port."""
@@ -206,14 +291,6 @@ def _update_proxy_lists(health_data):
 
 def _run_full_check_cycle():
     """Performs a health check on all target proxies and updates the global lists."""
-    if CHECK_MODE == 0:
-        check_func = check_proxy_ping_health
-    elif CHECK_MODE == 1:
-        check_func = check_proxy_download_health
-    else:
-        logging.error(f"Invalid CHECK_MODE '{CHECK_MODE}'. Cannot run check cycle.")
-        return
-
     health_data = {}
     if not _target_proxies:
         logging.warning("Monitor: No target proxies configured.")
@@ -222,8 +299,8 @@ def _run_full_check_cycle():
     logging.info(f"Starting full health check audit on all target proxies: {_target_proxies}")
     for host, port in _target_proxies:
         try:
-            ping_median, ping_success_rate  = check_proxy_ping_health(host, port)
-            download_median, download_success_rate  = check_proxy_download_health(host, port)
+            ping_median, ping_success_rate  = check_proxy_ping(host, port)
+            download_median, download_success_rate  = check_proxy_download_fixed(host, port)
             if ping_median is not None and download_median is not None:
                 if ping_success_rate > 50:
                     health_data[(host, port)] = download_median
