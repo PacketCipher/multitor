@@ -43,7 +43,7 @@ packet_stats_packet_loss_threshold = 0.5
 PING_MONITORING_INTERVAL = 1 * 60 * 60
 DOWNLOAD_MONITORING_INTERVAL = 12 * 60 * 60
 
-def check_proxy_ping_health(proxy_host, proxy_port, num_rounds=10, requests_per_round=10):
+def check_proxy_ping_health(proxy_host, proxy_port, num_rounds=30, requests_per_round=10):
     """Measures proxy performance by running multiple rounds of parallel requests."""
     TEST_URL = "http://connectivitycheck.gstatic.com/generate_204"
     HEALTH_CHECK_TIMEOUT = 5 # seconds
@@ -71,7 +71,7 @@ def check_proxy_ping_health(proxy_host, proxy_port, num_rounds=10, requests_per_
             return HEALTH_CHECK_TIMEOUT_PENALTY
 
     all_latencies = []
-    with ThreadPoolExecutor(max_workers=requests_per_round * num_rounds) as executor:
+    with ThreadPoolExecutor(max_workers=requests_per_round) as executor:
         futures = [executor.submit(_make_single_request) for _ in range(total_requests)]
         all_latencies = [f.result() for f in futures]
 
@@ -84,7 +84,8 @@ def check_proxy_ping_health(proxy_host, proxy_port, num_rounds=10, requests_per_
     logging.info(f"Successful requests: {success_count}/{total_requests} ({success_rate:.1f}%)")
     logging.info(f"Overall avg latency: {overall_avg_latency:.4f}s (includes penalties)")
     logging.info("---------------------------------")
-    return overall_avg_latency if overall_avg_latency != HEALTH_CHECK_TIMEOUT_PENALTY else None
+    overall_avg_latency = overall_avg_latency if overall_avg_latency != HEALTH_CHECK_TIMEOUT_PENALTY else None
+    return overall_avg_latency, success_rate
 
 class TotalTimeout(Exception):
     """Custom exception for total download timeout."""
@@ -136,9 +137,14 @@ def check_proxy_download_health(proxy_host, proxy_port, num_downloads=1, total_t
             # Catch connection errors, bad status codes, AND our custom total timeout.
             logging.warning(f"Download {i+1}/{num_downloads} failed: {e}")
             all_durations.append(DOWNLOAD_TIMEOUT_PENALTY)
+            
     overall_median_time = statistics.median(all_durations) if all_durations else DOWNLOAD_TIMEOUT_PENALTY
+    success_count = sum(1 for lat in all_durations if lat < DOWNLOAD_TIMEOUT_PENALTY)
+    success_rate = (success_count / num_downloads) * 100
+
     logging.info(f"--- Download Test Summary for {proxy_host}:{proxy_port}: Median time {overall_median_time:.2f}s ---")
-    return overall_median_time if overall_median_time < DOWNLOAD_TIMEOUT_PENALTY else None
+    overall_median_time = overall_median_time if overall_median_time < DOWNLOAD_TIMEOUT_PENALTY else None
+    return overall_median_time, success_rate
 
 def get_control_port(socks_port):
     """Derives the Tor control port from a SOCKS port."""
@@ -216,9 +222,11 @@ def _run_full_check_cycle():
     logging.info(f"Starting full health check audit on all target proxies: {_target_proxies}")
     for host, port in _target_proxies:
         try:
-            performance_metric = check_func(host, port)
-            if performance_metric is not None:
-                health_data[(host, port)] = performance_metric
+            ping_median, ping_success_rate  = check_proxy_ping_health(host, port)
+            download_median, download_success_rate  = check_proxy_download_health(host, port)
+            if ping_median is not None and download_median is not None:
+                if ping_success_rate > 50:
+                    health_data[(host, port)] = download_median
         except Exception as e:
             logging.error(f"Error during health check for proxy {host}:{port}: {e}", exc_info=False)
     _update_proxy_lists(health_data)
