@@ -86,33 +86,59 @@ def check_proxy_ping_health(proxy_host, proxy_port, num_rounds=10, requests_per_
     logging.info("---------------------------------")
     return overall_avg_latency if overall_avg_latency != HEALTH_CHECK_TIMEOUT_PENALTY else None
 
-def check_proxy_download_health(proxy_host, proxy_port, num_downloads=1):
-    """Measures the average time it takes to download a test file via a proxy."""
-    DOWNLOAD_URL = "https://proof.ovh.net/files/10Mb.dat"
-    DOWNLOAD_TIMEOUT = 30 # in seconds
-    DOWNLOAD_TIMEOUT_PENALTY = 99999
+class TotalTimeout(Exception):
+    """Custom exception for total download timeout."""
+    pass
 
-    logging.info(f"--- Starting Download Time Test for {proxy_host}:{proxy_port} ---")
+def check_proxy_download_health(proxy_host, proxy_port, num_downloads=1, total_timeout=200):
+    """
+    Measures the median time it takes to download a test file via a proxy,
+    enforcing a total time limit for the download.
+    """
+    DOWNLOAD_URL = "https://proof.ovh.net/files/10Mb.dat"
+    # A penalty value significantly higher than any possible timeout
+    DOWNLOAD_TIMEOUT_PENALTY = 99999
+    # A reasonable connect/read timeout for establishing the connection and getting the first byte
+    # This prevents the initial request from hanging indefinitely.
+    INITIAL_REQUEST_TIMEOUT = (15, 30) # (connect_timeout, read_timeout)
+
+    logging.info(f"--- Starting Download Time Test for {proxy_host}:{proxy_port} (Total Timeout: {total_timeout}s) ---")
     session = requests.Session()
     session.proxies = {
         'http': f'socks5h://{proxy_host}:{proxy_port}',
-        'https': f'socks5h://{proxy_host}:{proxy_port}'
+        'httpss': f'socks5h://{proxy_host}:{proxy_port}'
     }
     all_durations = []
+    
     for i in range(num_downloads):
+        start_time = time.time()
         try:
-            start_time = time.time()
-            response = session.get(DOWNLOAD_URL, timeout=DOWNLOAD_TIMEOUT)
-            response.raise_for_status()
+            # Use stream=True to avoid downloading the entire content at once.
+            # This lets us control the download process.
+            with session.get(DOWNLOAD_URL, stream=True, timeout=INITIAL_REQUEST_TIMEOUT) as response:
+                response.raise_for_status()
+                # We will write to a null-like object to consume the download content
+                # without saving it to memory or disk.
+                # In Python 3, io.BytesIO() is a good in-memory buffer.
+                # For very large files, you might use open(os.devnull, 'wb')
+                from io import BytesIO
+                downloaded_content = BytesIO()
+                for chunk in response.iter_content(chunk_size=8192):
+                    # Check the total elapsed time on each chunk
+                    if time.time() - start_time > total_timeout:
+                        raise TotalTimeout(f"Download exceeded total timeout of {total_timeout} seconds.")  
+                    downloaded_content.write(chunk)
+            # If the loop completes without raising TotalTimeout, the download was successful and within the time limit.
             duration = time.time() - start_time
             all_durations.append(duration)
-        except requests.exceptions.RequestException:
+            logging.info(f"Download {i+1}/{num_downloads} success in {duration:.2f}s")
+        except (requests.exceptions.RequestException, TotalTimeout) as e:
+            # Catch connection errors, bad status codes, AND our custom total timeout.
+            logging.warning(f"Download {i+1}/{num_downloads} failed: {e}")
             all_durations.append(DOWNLOAD_TIMEOUT_PENALTY)
-    # overall_avg_time = sum(all_durations) / len(all_durations) if all_durations else DOWNLOAD_TIMEOUT_PENALTY
-    overall_avg_time = statistics.median(all_durations)
-
-    logging.info(f"--- Download Test Summary for {proxy_host}:{proxy_port}: Avg time {overall_avg_time:.2f}s ---")
-    return overall_avg_time if overall_avg_time != DOWNLOAD_TIMEOUT_PENALTY else None
+    overall_median_time = statistics.median(all_durations) if all_durations else DOWNLOAD_TIMEOUT_PENALTY
+    logging.info(f"--- Download Test Summary for {proxy_host}:{proxy_port}: Median time {overall_median_time:.2f}s ---")
+    return overall_median_time if overall_median_time < DOWNLOAD_TIMEOUT_PENALTY else None
 
 def get_control_port(socks_port):
     """Derives the Tor control port from a SOCKS port."""
