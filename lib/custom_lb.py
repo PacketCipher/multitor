@@ -291,6 +291,14 @@ def _update_proxy_lists(health_data):
 
 def _run_full_check_cycle():
     """Performs a health check on all target proxies and updates the global lists."""
+    if CHECK_MODE == 0:
+        check_func = check_proxy_ping
+    elif CHECK_MODE == 1:
+        check_func = check_proxy_download_fixed
+    else:
+        logging.error(f"Invalid CHECK_MODE '{CHECK_MODE}'. Cannot run check cycle.")
+        return
+
     health_data = {}
     if not _target_proxies:
         logging.warning("Monitor: No target proxies configured.")
@@ -299,11 +307,16 @@ def _run_full_check_cycle():
     logging.info(f"Starting full health check audit on all target proxies: {_target_proxies}")
     for host, port in _target_proxies:
         try:
-            ping_median, ping_success_rate  = check_proxy_ping(host, port)
-            download_median, download_success_rate  = check_proxy_download_fixed(host, port)
-            if ping_median is not None and download_median is not None:
-                if ping_success_rate > 50:
-                    health_data[(host, port)] = download_median
+            # Ping Filter & Download Sort #
+            # ping_median, ping_success_rate  = check_proxy_ping(host, port)
+            # download_median, download_success_rate  = check_proxy_download_fixed(host, port)
+            # if ping_median is not None and download_median is not None:
+            #     if ping_success_rate > 50:
+            #         health_data[(host, port)] = download_median
+            # Ping | Download Sort #
+            check_median, check_success_rate  = check_func(host, port)
+            if check_median is not None:
+                    health_data[(host, port)] = check_median
         except Exception as e:
             logging.error(f"Error during health check for proxy {host}:{port}: {e}", exc_info=False)
     _update_proxy_lists(health_data)
