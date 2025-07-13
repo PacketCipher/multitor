@@ -175,7 +175,7 @@ def check_proxy_download_fixed(proxy_host, proxy_port, num_tests=1, test_duratio
     session = requests.Session()
     session.proxies = {
         'http': f'socks5h://{proxy_host}:{proxy_port}',
-        'httpss': f'socks5h://{proxy_host}:{proxy_port}'
+        'https': f'socks5h://{proxy_host}:{proxy_port}'
     }
     
     all_speeds = []
