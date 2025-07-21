@@ -14,9 +14,13 @@ from stem import CircStatus, GuardStatus, StatusType
 from stem.control import EventType
 from stem import Signal
 import statistics
+from lib.api_client import ApiClient
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s')
+
+# API client for managing Tor instances
+api_client = ApiClient()
 
 # --- Shared state and trigger mechanism ---
 _shared_state_lock = threading.Lock()
@@ -289,8 +293,15 @@ def _update_proxy_lists(health_data):
         _top_proxies = new_top_proxies
         logging.info(f"Full list of healthy proxies updated ({len(_healthy_sorted_proxies)} total): {_healthy_sorted_proxies}")
 
+    # Pause Tor instances that are not in the top proxies list
+    top_proxies_ports = [p[1] for p in _top_proxies]
+    api_client.pause_all_except(top_proxies_ports)
+
 def _run_full_check_cycle():
     """Performs a health check on all target proxies and updates the global lists."""
+    # Resume all Tor instances before running the health checks
+    api_client.resume_all()
+
     if CHECK_MODE == 0:
         check_func = check_proxy_ping
     elif CHECK_MODE == 1:
@@ -418,6 +429,7 @@ def monitor_proxies():
         event_was_set = _full_recheck_needed_event.wait(timeout=MONITORING_INTERVAL)
         if event_was_set:
             logging.info("--- Emergency threshold breached. Starting full re-check audit... ---")
+            api_client.resume_all()
             _full_recheck_needed_event.clear()
         else:
             logging.info(f"--- Periodic interval ({MONITORING_INTERVAL}s) reached. Starting fallback re-check audit... ---")

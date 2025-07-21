@@ -135,6 +135,11 @@ function CreateTorProcess() {
 
     _tor_processes_done=$((_tor_processes_done + 1))
 
+    # Register the PID with the API server
+    local _pid
+    _pid=$(cat "${_proc_dir}/${_arg_socks}.pid")
+    curl -s -X POST -H "Content-Type: application/json" -d "{\"socks_port\": ${_arg_socks}, \"pid\": ${_pid}}" http://127.0.0.1:5001/update_pid
+
   else
 
     _logger "warn" \
