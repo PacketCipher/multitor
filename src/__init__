@@ -602,6 +602,9 @@ function __main__() {
 
     fi
 
+    # Start the API server in the background
+    python3 "${_lib}/api_server.py" &
+    
     for i in $(seq 0 $((init_number - 1))) ; do
 
       _logger "info" \
@@ -691,8 +694,6 @@ function __main__() {
     if [[ "$proxy_state" -eq 1 ]] ; then
 
       if [[ "$proxy_type" == "custom_lb" ]] ; then
-        # Start the API server in the background
-        python3 "${_lib}/api_server.py" &
         # Source and call CreateCustomLbProcess
         # shellcheck disable=SC1090,SC1091
         source "${_lib}/CreateCustomLbProcess"
