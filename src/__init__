@@ -603,7 +603,7 @@ function __main__() {
     fi
 
     # Start the API server in the background
-    python3 "${_lib}/api_server.py" &
+    python3 "${_lib}/api_server.py" & sleep 30s
     
     for i in $(seq 0 $((init_number - 1))) ; do
 
