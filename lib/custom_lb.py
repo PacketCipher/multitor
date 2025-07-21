@@ -14,7 +14,7 @@ from stem import CircStatus, GuardStatus, StatusType
 from stem.control import EventType
 from stem import Signal
 import statistics
-from lib.api_client import ApiClient
+from api_client import ApiClient
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s')
