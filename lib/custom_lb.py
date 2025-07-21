@@ -294,8 +294,7 @@ def _update_proxy_lists(health_data):
         logging.info(f"Full list of healthy proxies updated ({len(_healthy_sorted_proxies)} total): {_healthy_sorted_proxies}")
 
     # Pause Tor instances that are not in the top proxies list
-    # top_proxies_ports = [p[1] for p in _top_proxies]
-    top_proxies_ports = [p[1] for p in _top_proxies[:TOP_N_PROXIES]]
+    top_proxies_ports = [p[1] for p in _top_proxies]
     api_client.pause_all_except(top_proxies_ports)
 
 def _run_full_check_cycle():
