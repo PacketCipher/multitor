@@ -1,4 +1,5 @@
 import socket
+import select
 import threading
 import time
 import requests
@@ -38,10 +39,16 @@ _round_robin_index = 0
 _target_proxies = []
 # This event is set if the number of healthy proxies drops below N.
 _full_recheck_needed_event = threading.Event()
+# Track proxies that have been reactively demoted since the last full check
+_demoted_proxies = set()
 # Packet stats
 packet_stats_per_proxy = {}
 packet_stats_n_packets_threshold = 100
 packet_stats_packet_loss_threshold = 0.5
+
+# Max concurrent client connections to prevent thread exhaustion
+MAX_CONCURRENT_CLIENTS = 500
+_client_semaphore = threading.BoundedSemaphore(MAX_CONCURRENT_CLIENTS)
 
 # --- CONSTANTS for health checks ---
 PING_MONITORING_INTERVAL = 1 * 60 * 60
@@ -232,6 +239,9 @@ def check_proxy_download_fixed(proxy_host, proxy_port, num_tests=1, test_duratio
     median_speed_mbps = median_speed_bps / (1024 * 1024)
     logging.info(f"--- Speed Test Summary for {proxy_host}:{proxy_port}: Median Speed {median_speed_mbps:.2f} MB/s | Success Rate: {success_rate:.1f}% ---")
     
+    if median_speed_bps <= 0:
+        return None, 0.0
+
     median_speed_bps = 1 / median_speed_bps # Inverse It For Ascending Sort
     return median_speed_bps, success_rate
 
@@ -242,43 +252,65 @@ def get_control_port(socks_port):
 def trigger_reactive_removal(proxy_tuple, reason):
     """
     Central function to handle a reactive failure.
-    It removes the failed proxy and only triggers a full re-check if the
-    number of healthy proxies falls below the critical threshold.
+    Instead of permanently removing the failed proxy, it moves it to the end
+    of the list and updates the top-N proxies.
     """
+    global _demoted_proxies
+    controller_to_reload = None
+
     with _shared_state_lock:
         if proxy_tuple in _healthy_sorted_proxies:
-            logging.warning(f"REACTIVE TRIGGER ({reason}) for proxy {proxy_tuple}. Removing from active pool.")
+            logging.warning(f"REACTIVE TRIGGER ({reason}) for proxy {proxy_tuple}. Moving to end of active pool.")
+            # Move to end of the list instead of removing
             _healthy_sorted_proxies.remove(proxy_tuple)
+            _healthy_sorted_proxies.append(proxy_tuple)
+            _demoted_proxies.add(proxy_tuple)
 
-            # Rebuild the top-N list from the now smaller healthy list
+            # Rebuild the top-N list from the rearranged healthy list
             global _top_proxies, _round_robin_index
             new_top_proxies = _healthy_sorted_proxies[:TOP_N_PROXIES]
             if _top_proxies != new_top_proxies:
                 _top_proxies = new_top_proxies
                 _round_robin_index = 0
-                logging.info(f"Top-N list updated due to removal. New list: {new_top_proxies}")
+                logging.info(f"Top-N list updated due to demotion. New list: {new_top_proxies}")
 
-            # Conditionally trigger a full re-check
-            if len(_healthy_sorted_proxies) <= TOP_N_PROXIES:
-                logging.error(f"Healthy proxies ({len(_healthy_sorted_proxies)}) dropped below threshold ({TOP_N_PROXIES}). Triggering emergency re-check.")
+            # Conditionally trigger a full re-check if available undemoted healthy proxies fall below TOP_N
+            available_healthy = len(_healthy_sorted_proxies) - len(_demoted_proxies)
+            if available_healthy < TOP_N_PROXIES:
+                logging.error(f"Healthy un-demoted proxies ({available_healthy}) dropped below threshold ({TOP_N_PROXIES}). Triggering emergency re-check.")
+                _demoted_proxies.clear()
                 _full_recheck_needed_event.set()
-            
-            controller = bootstrapped_controllers[proxy_tuple]
-            controller.signal(Signal.HUP)
-            logging.info(f"Tor Reloaded For {proxy_tuple}")
+
+            # Reset packet statistics for this proxy so it can be re-evaluated later
+            if proxy_tuple in packet_stats_per_proxy:
+                packet_stats_per_proxy[proxy_tuple] = {"Successful": 0, "Failed": 0}
+
+            if bootstrapped_controllers and proxy_tuple in bootstrapped_controllers:
+                controller_to_reload = bootstrapped_controllers[proxy_tuple]
         else:
             logging.info(f"Reactive trigger for {proxy_tuple} ignored as it was already removed.")
+
+    # Execute Tor reload OUTSIDE the lock in a daemon thread so an unresponsive controller doesn't lock up all connections
+    if controller_to_reload:
+        def _async_hup(ctrl, pt):
+            try:
+                ctrl.signal(Signal.HUP)
+                logging.info(f"Tor Reloaded For {pt}")
+            except Exception as ex:
+                logging.warning(f"Failed to reload Tor for {pt}: {ex}")
+        threading.Thread(target=_async_hup, args=(controller_to_reload, proxy_tuple), daemon=True).start()
 
 def _update_proxy_lists(health_data):
     """
     Takes health data from a full check, sorts it, and updates the global proxy lists.
     """
-    global _healthy_sorted_proxies, _top_proxies, _round_robin_index
-    # Lower score is better (faster)
+    global _healthy_sorted_proxies, _top_proxies, _round_robin_index, _demoted_proxies
+    # Lower score is better (faster). Failed proxies with float('inf') sort to the end.
     sorted_proxies_with_metric = sorted(health_data.items(), key=lambda item: item[1])
     new_healthy_sorted = [proxy for proxy, metric in sorted_proxies_with_metric]
 
     with _shared_state_lock:
+        _demoted_proxies.clear() # Reset demoted tracker on full check cycle update
         _healthy_sorted_proxies = new_healthy_sorted
         new_top_proxies = _healthy_sorted_proxies[:TOP_N_PROXIES]
 
@@ -325,30 +357,39 @@ def _run_full_check_cycle():
             #     if ping_success_rate > 50:
             #         health_data[(host, port)] = download_median
             # Ping | Download Sort #
-            check_median, check_success_rate  = check_func(host, port)
-            if check_median is not None:
-                    health_data[(host, port)] = check_median
+            check_median, check_success_rate = check_func(host, port)
+            if check_median is not None and check_success_rate > 0:
+                health_data[(host, port)] = check_median
+            else:
+                # Proxy failed check: assign infinity so it sorts to the end of the list
+                logging.warning(f"Proxy {host}:{port} failed check. Adding to end of list.")
+                health_data[(host, port)] = float('inf')
         except Exception as e:
-            logging.error(f"Error during health check for proxy {host}:{port}: {e}", exc_info=False)
+            logging.error(f"Error during health check for proxy {host}:{port}: {e}. Adding to end of list.", exc_info=False)
+            health_data[(host, port)] = float('inf')
     _update_proxy_lists(health_data)
     logging.info("--- Full health check audit complete. ---")
 
 def store_entry_guards(bootstrapped_controllers):
     for proxy_tuple, controller in bootstrapped_controllers.items():
         guards = []
-        for circ in sorted(controller.get_circuits()):
-            if circ.status != CircStatus.BUILT:
-                continue
-            guard_fingerprint = circ.path[0][0] # [First Node Of Circuit][Fingerprint]
-            guards.append(guard_fingerprint)
-        most_frequent_guard = max(set(guards), key=guards.count)
-        entry_guards[proxy_tuple] = most_frequent_guard
+        try:
+            for circ in sorted(controller.get_circuits()):
+                if circ.status != CircStatus.BUILT:
+                    continue
+                guard_fingerprint = circ.path[0][0] # [First Node Of Circuit][Fingerprint]
+                guards.append(guard_fingerprint)
+            if guards:
+                most_frequent_guard = max(set(guards), key=guards.count)
+                entry_guards[proxy_tuple] = most_frequent_guard
+        except Exception as e:
+            logging.warning(f"Error fetching guards for {proxy_tuple}: {e}")
 
 # --- FIXED & CORRECT EVENT HANDLERS ---
 def generic_guard_handler(proxy_tuple, event):
     """Handles GUARD events. This logic was correct."""
     if event.status in [GuardStatus.DOWN, GuardStatus.BAD]:
-        if event.endpoint_fingerprint == entry_guards[proxy_tuple]:
+        if event.endpoint_fingerprint == entry_guards.get(proxy_tuple):
             logging.warning(f"Proxy {proxy_tuple} reported guard status: {event.status}. Triggering removal.")
             trigger_reactive_removal(proxy_tuple, f"GUARD {event.status}")
 
@@ -466,6 +507,9 @@ def handle_client_connection(client_socket, client_address):
     proxy_socket = None # Ensure proxy_socket is defined for the finally block
 
     try:
+        # Enforce connection timeout on client socket to avoid hanging threads
+        client_socket.settimeout(10)
+
         # --- Use the round-robin selection function ---
         upstream_proxy = select_proxy_round_robin()
         if not upstream_proxy:
@@ -562,16 +606,26 @@ def handle_client_connection(client_socket, client_address):
             logging.error(f"Upstream SOCKS proxy {upstream_host}:{upstream_port} failed request for {client_address}. REP: {proxy_reply_header[1]}.")
         
         if upstream_proxy:
-            packet_stats_per_proxy[upstream_proxy]["Successful"] += 1
+            with _shared_state_lock:
+                if upstream_proxy not in packet_stats_per_proxy:
+                    packet_stats_per_proxy[upstream_proxy] = {"Successful": 0, "Failed": 0}
+                packet_stats_per_proxy[upstream_proxy]["Successful"] += 1
 
     except (socket.error, socks.SOCKS5Error, BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as e:
         logging.error(f"Error during SOCKS relay for {client_address} via {upstream_proxy}: {e}")
         if upstream_proxy:
-            packet_stats_per_proxy[upstream_proxy]["Failed"] += 1
-            if (packet_stats_per_proxy[upstream_proxy]["Successful"] + packet_stats_per_proxy[upstream_proxy]["Failed"]) > packet_stats_n_packets_threshold:
-                if packet_stats_per_proxy[upstream_proxy]["Failed"] / (packet_stats_per_proxy[upstream_proxy]["Successful"] + packet_stats_per_proxy[upstream_proxy]["Failed"]) > packet_stats_packet_loss_threshold:
-                    trigger_reactive_removal(upstream_proxy, "SOCKS FAILURE")
+            should_demote = False
+            with _shared_state_lock:
+                if upstream_proxy not in packet_stats_per_proxy:
                     packet_stats_per_proxy[upstream_proxy] = {"Successful": 0, "Failed": 0}
+                packet_stats_per_proxy[upstream_proxy]["Failed"] += 1
+                total = packet_stats_per_proxy[upstream_proxy]["Successful"] + packet_stats_per_proxy[upstream_proxy]["Failed"]
+                if total > packet_stats_n_packets_threshold:
+                    if packet_stats_per_proxy[upstream_proxy]["Failed"] / total > packet_stats_packet_loss_threshold:
+                        should_demote = True
+
+            if should_demote:
+                trigger_reactive_removal(upstream_proxy, "SOCKS FAILURE")
         
         if not client_socket._closed:
             try:
@@ -586,38 +640,37 @@ def handle_client_connection(client_socket, client_address):
         logging.info(f"Closed connection for {client_address}")
 
 def relay_data(sock1, sock2, client_address):
-    """Relays data between two sockets until one closes or an error occurs."""
-    done_event = threading.Event()
+    """
+    Relays data between two sockets until one closes or an error occurs.
+    Single-threaded implementation using select to prevent thread exhaustion.
+    """
+    sockets = [sock1, sock2]
+    sock1.settimeout(60)
+    sock2.settimeout(60)
 
-    def _forward(s_from, s_to, direction):
-        try:
-            while not done_event.is_set():
-                data = s_from.recv(4096)
+    try:
+        while True:
+            rlist, _, xlist = select.select(sockets, [], sockets, 60)
+            if xlist or not rlist:
+                break
+            for s in rlist:
+                other = sock2 if s is sock1 else sock1
+                data = s.recv(8192)
                 if not data:
-                    break
-                s_to.sendall(data)
-        except (socket.error, BrokenPipeError, ConnectionResetError) as e:
-            if not done_event.is_set():
-                 logging.debug(f"Socket error during relay ({direction}) for {client_address}: {e}")
-        finally:
-            done_event.set()
-
-    t1 = threading.Thread(target=_forward, args=(sock1, sock2, "client_to_proxy"))
-    t2 = threading.Thread(target=_forward, args=(sock2, sock1, "proxy_to_client"))
-    t1.daemon = True
-    t2.daemon = True
-    t1.start()
-    t2.start()
-    done_event.wait()
-    for s in [sock1, sock2]:
-        if not s._closed:
-            try:
-                s.shutdown(socket.SHUT_RDWR)
-            except socket.error:
-                pass
-            finally:
-                s.close()
-    logging.debug(f"Relay finished for {client_address}")
+                    return
+                other.sendall(data)
+    except (socket.error, BrokenPipeError, ConnectionResetError) as e:
+        logging.debug(f"Socket error during relay for {client_address}: {e}")
+    finally:
+        for s in sockets:
+            if not s._closed:
+                try:
+                    s.shutdown(socket.SHUT_RDWR)
+                except socket.error:
+                    pass
+                finally:
+                    s.close()
+        logging.debug(f"Relay finished for {client_address}")
 
 def start_server(listen_host, listen_port):
     """Starts the SOCKS5 proxy server and listens for connections."""
@@ -635,7 +688,19 @@ def start_server(listen_host, listen_port):
     while True:
         try:
             client_socket, client_address = server_socket.accept()
-            client_thread = threading.Thread(target=handle_client_connection, args=(client_socket, client_address))
+            # Prevent 'can't start new thread' by capping total concurrent threads
+            if not _client_semaphore.acquire(blocking=False):
+                logging.warning(f"Connection limit reached ({MAX_CONCURRENT_CLIENTS}). Dropping {client_address}")
+                client_socket.close()
+                continue
+
+            def _worker_wrapper(cs, ca):
+                try:
+                    handle_client_connection(cs, ca)
+                finally:
+                    _client_semaphore.release()
+
+            client_thread = threading.Thread(target=_worker_wrapper, args=(client_socket, client_address))
             client_thread.daemon = True
             client_thread.start()
         except KeyboardInterrupt:
@@ -686,7 +751,7 @@ def wait_for_all_to_bootstrap(target_proxies, control_password):
     
     while proxies_to_check:
         newly_bootstrapped_proxies = set()
-        for proxy_tuple in proxies_to_check:
+        for proxy_tuple in list(proxies_to_check):
             host, port = proxy_tuple
             controller = bootstrapped_controllers.get(proxy_tuple)
 
@@ -710,7 +775,8 @@ def wait_for_all_to_bootstrap(target_proxies, control_password):
             for p in newly_bootstrapped_proxies:
                 logging.info(f"Proxy {p} is fully bootstrapped.")
                 with _shared_state_lock:
-                    _top_proxies.append(p)
+                    if p not in _top_proxies:
+                        _top_proxies.append(p)
         
         if proxies_to_check:
             logging.info(f"Still waiting for {len(proxies_to_check)} proxies to bootstrap: {list(proxies_to_check)}")
@@ -718,12 +784,17 @@ def wait_for_all_to_bootstrap(target_proxies, control_password):
         
         current_time = time.time()
         if current_time - start_time > 30 * 60:
-            for proxy_tuple in proxies_to_check:
+            for proxy_tuple in list(proxies_to_check):
                 # Free-Up Memory & CPU #
-                controller = bootstrapped_controllers[proxy_tuple]
-                controller.signal(Signal.SHUTDOWN)
-                target_proxies.remove(proxy_tuple)
-                bootstrapped_controllers.pop(proxy_tuple)
+                controller = bootstrapped_controllers.get(proxy_tuple)
+                if controller:
+                    try:
+                        controller.signal(Signal.SHUTDOWN)
+                    except Exception:
+                        pass
+                    bootstrapped_controllers.pop(proxy_tuple, None)
+                if proxy_tuple in target_proxies:
+                    target_proxies.remove(proxy_tuple)
             break
 
     logging.info("All target Tor instances are bootstrapped.")
