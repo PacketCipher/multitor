@@ -54,6 +54,16 @@ _client_semaphore = threading.BoundedSemaphore(MAX_CONCURRENT_CLIENTS)
 PING_MONITORING_INTERVAL = 1 * 60 * 60
 DOWNLOAD_MONITORING_INTERVAL = 12 * 60 * 60
 
+def _recv_exact(sock, num_bytes):
+    """Helper to receive exactly num_bytes from a socket."""
+    buf = bytearray()
+    while len(buf) < num_bytes:
+        chunk = sock.recv(num_bytes - len(buf))
+        if not chunk:
+            return None
+        buf.extend(chunk)
+    return bytes(buf)
+
 def check_proxy_ping(proxy_host, proxy_port, num_rounds=10, requests_per_round=10):
     """Measures proxy performance by running multiple rounds of parallel requests."""
     TEST_URL = "http://connectivitycheck.gstatic.com/generate_204"
@@ -300,6 +310,26 @@ def trigger_reactive_removal(proxy_tuple, reason):
                 logging.warning(f"Failed to reload Tor for {pt}: {ex}")
         threading.Thread(target=_async_hup, args=(controller_to_reload, proxy_tuple), daemon=True).start()
 
+def _record_proxy_result(proxy_tuple, success, reason="SOCKS FAILURE"):
+    """Records packet stats and reactively triggers demotion if error rate is too high."""
+    if not proxy_tuple:
+        return
+    should_demote = False
+    with _shared_state_lock:
+        if proxy_tuple not in packet_stats_per_proxy:
+            packet_stats_per_proxy[proxy_tuple] = {"Successful": 0, "Failed": 0}
+        if success:
+            packet_stats_per_proxy[proxy_tuple]["Successful"] += 1
+        else:
+            packet_stats_per_proxy[proxy_tuple]["Failed"] += 1
+            total = packet_stats_per_proxy[proxy_tuple]["Successful"] + packet_stats_per_proxy[proxy_tuple]["Failed"]
+            if total > packet_stats_n_packets_threshold:
+                if packet_stats_per_proxy[proxy_tuple]["Failed"] / total > packet_stats_packet_loss_threshold:
+                    should_demote = True
+
+    if should_demote:
+        trigger_reactive_removal(proxy_tuple, reason)
+
 def _update_proxy_lists(health_data):
     """
     Takes health data from a full check, sorts it, and updates the global proxy lists.
@@ -326,8 +356,9 @@ def _update_proxy_lists(health_data):
         logging.info(f"Full list of healthy proxies updated ({len(_healthy_sorted_proxies)} total): {_healthy_sorted_proxies}")
 
     # Pause Tor instances that are not in the top proxies list
-    top_proxies_ports = [p[1] for p in _top_proxies]
-    api_client.pause_all_except(top_proxies_ports)
+    # (Kept active across all healthy proxies so fallbacks can serve traffic)
+    healthy_ports = [p[1] for p in _healthy_sorted_proxies]
+    api_client.pause_all_except(healthy_ports)
 
 def _run_full_check_cycle():
     """Performs a health check on all target proxies and updates the global lists."""
@@ -483,23 +514,45 @@ def monitor_proxies():
         except Exception:
             pass
 
-
-def select_proxy_round_robin():
-    """Selects a proxy from the top N list using a round-robin strategy."""
+def get_candidate_proxies():
+    """
+    Returns an ordered list of proxies for a request:
+    1. First tries the proxy selected by round-robin from top N.
+    2. On failure, iterates sequentially through the rest of _healthy_sorted_proxies
+       until the end of the list (wrapping around so no healthy proxy is missed).
+    """
     global _round_robin_index
     with _shared_state_lock:
-        if not _top_proxies:
-            return None # No healthy proxies available
+        pool = list(_healthy_sorted_proxies) if _healthy_sorted_proxies else list(_top_proxies)
+        if not pool:
+            return []
 
         # Select proxy using round-robin logic
-        selected_proxy = _top_proxies[_round_robin_index % len(_top_proxies)]
-        _round_robin_index += 1
+        if _top_proxies:
+            selected_proxy = _top_proxies[_round_robin_index % len(_top_proxies)]
+            _round_robin_index += 1
+        else:
+            selected_proxy = pool[_round_robin_index % len(pool)]
+            _round_robin_index += 1
 
         # Prevent the index from growing indefinitely (optional, but good practice)
         if _round_robin_index > 1000000:
-             _round_robin_index = 0
+            _round_robin_index = 0
 
-        return selected_proxy
+        # Build candidate list starting from selected_proxy and continuing
+        # through _healthy_sorted_proxies to the end of the list.
+        if selected_proxy in pool:
+            idx = pool.index(selected_proxy)
+            candidates = pool[idx:] + pool[:idx]
+        else:
+            candidates = [selected_proxy] + [p for p in pool if p != selected_proxy]
+
+        return candidates
+
+def select_proxy_round_robin():
+    """Selects a proxy from the top N list using a round-robin strategy."""
+    candidates = get_candidate_proxies()
+    return candidates[0] if candidates else None
 
 def handle_client_connection(client_socket, client_address):
     """Handles a single client connection, forwarding it through a selected SOCKS5 proxy."""
@@ -510,18 +563,8 @@ def handle_client_connection(client_socket, client_address):
         # Enforce connection timeout on client socket to avoid hanging threads
         client_socket.settimeout(10)
 
-        # --- Use the round-robin selection function ---
-        upstream_proxy = select_proxy_round_robin()
-        if not upstream_proxy:
-            logging.error(f"No healthy upstream SOCKS proxy available for {client_address}. Closing connection.")
-            client_socket.close()
-            return
-
-        upstream_host, upstream_port = upstream_proxy
-        logging.info(f"Selected upstream SOCKS proxy {upstream_host}:{upstream_port} for {client_address} via round-robin")
-
         # 2. SOCKS5 handshake with the client (Version identifier/method selection)
-        version_id_msg = client_socket.recv(2)
+        version_id_msg = _recv_exact(client_socket, 2)
         if not version_id_msg or len(version_id_msg) < 2:
             logging.warning(f"Client {client_address} sent incomplete version/nmethods. Closing.")
             client_socket.close(); return
@@ -530,15 +573,15 @@ def handle_client_connection(client_socket, client_address):
         if sock_version != 0x05:
             logging.error(f"Unsupported SOCKS version from {client_address}: {sock_version}"); client_socket.close(); return
 
-        client_methods = client_socket.recv(nmethods)
-        if 0x00 not in client_methods:
+        client_methods = _recv_exact(client_socket, nmethods)
+        if not client_methods or 0x00 not in client_methods:
             logging.error(f"Client {client_address} does not support NO AUTH method. Closing.")
             client_socket.sendall(b'\x05\xFF'); client_socket.close(); return
 
         client_socket.sendall(b'\x05\x00') # Select NO AUTH method
 
         # 3. SOCKS5 client request (get destination from client)
-        client_req_header = client_socket.recv(4)
+        client_req_header = _recv_exact(client_socket, 4)
         if not client_req_header or len(client_req_header) < 4:
             logging.warning(f"Client {client_address} sent incomplete request header. Closing."); client_socket.close(); return
 
@@ -548,90 +591,120 @@ def handle_client_connection(client_socket, client_address):
             client_socket.sendall(b'\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00'); client_socket.close(); return
 
         if req_atyp == 0x01: # IPv4
-            dst_addr_bytes = client_socket.recv(4)
+            dst_addr_bytes = _recv_exact(client_socket, 4)
         elif req_atyp == 0x03: # Domain name
-            domain_len_byte = client_socket.recv(1)
+            domain_len_byte = _recv_exact(client_socket, 1)
+            if not domain_len_byte:
+                logging.warning(f"Client {client_address} sent incomplete domain length. Closing."); client_socket.close(); return
             domain_len = domain_len_byte[0]
-            dst_addr_bytes = domain_len_byte + client_socket.recv(domain_len)
+            domain_bytes = _recv_exact(client_socket, domain_len)
+            if not domain_bytes:
+                logging.warning(f"Client {client_address} sent incomplete domain body. Closing."); client_socket.close(); return
+            dst_addr_bytes = domain_len_byte + domain_bytes
         elif req_atyp == 0x04: # IPv6
-            dst_addr_bytes = client_socket.recv(16)
+            dst_addr_bytes = _recv_exact(client_socket, 16)
         else:
             logging.error(f"Unsupported ATYP from {client_address}: {req_atyp}. Sending error.")
             client_socket.sendall(b'\x05\x08\x00\x01\x00\x00\x00\x00\x00\x00'); client_socket.close(); return
 
-        dst_port_bytes = client_socket.recv(2)
-        if len(dst_addr_bytes) < 1 or len(dst_port_bytes) < 2:
-             logging.warning(f"Client {client_address} sent incomplete address/port. Closing."); client_socket.close(); return
+        dst_port_bytes = _recv_exact(client_socket, 2)
+        if not dst_addr_bytes or not dst_port_bytes or len(dst_addr_bytes) < 1 or len(dst_port_bytes) < 2:
+            logging.warning(f"Client {client_address} sent incomplete address/port. Closing."); client_socket.close(); return
 
-        # 4. Connect and handshake with the upstream SOCKS proxy
-        logging.debug(f"Connecting to upstream proxy {upstream_host}:{upstream_port}")
-        proxy_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        proxy_socket.settimeout(10)
-        proxy_socket.connect((upstream_host, upstream_port))
-
-        proxy_socket.sendall(b'\x05\x01\x00')
-        server_choice = proxy_socket.recv(2)
-        if len(server_choice) < 2 or server_choice[0] != 0x05 or server_choice[1] != 0x00:
-            raise socks.SOCKS5Error(f"Upstream proxy {upstream_host}:{upstream_port} did not accept NO AUTH method. Reply: {server_choice.hex()}")
-        logging.debug(f"Handshake with upstream proxy {upstream_host}:{upstream_port} successful.")
-
-        # 5. Forward client's request to upstream proxy
         upstream_request = client_req_header + dst_addr_bytes + dst_port_bytes
-        proxy_socket.sendall(upstream_request)
 
-        # 6. Relay reply from upstream proxy back to client
-        proxy_reply_header = proxy_socket.recv(4)
-        if not proxy_reply_header or len(proxy_reply_header) < 4:
-            raise ConnectionAbortedError("Upstream proxy closed connection before sending reply header.")
+        # --- Use the round-robin selection function ---
+        candidate_proxies = get_candidate_proxies()
+        if not candidate_proxies:
+            logging.error(f"No healthy upstream SOCKS proxy available for {client_address}. Closing connection.")
+            client_socket.sendall(b'\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00')
+            client_socket.close()
+            return
 
-        client_socket.sendall(proxy_reply_header)
-        reply_atyp = proxy_reply_header[3]
+        connected_proxy = None
 
-        bnd_len = 0
-        if reply_atyp == 0x01: bnd_len = 4
-        elif reply_atyp == 0x04: bnd_len = 16
-        elif reply_atyp == 0x03:
-            len_byte = proxy_socket.recv(1)
-            client_socket.sendall(len_byte)
-            bnd_len = len_byte[0]
+        for upstream_proxy in candidate_proxies:
+            upstream_host, upstream_port = upstream_proxy
+            logging.info(f"Selected upstream SOCKS proxy {upstream_host}:{upstream_port} for {client_address} via round-robin")
+            temp_proxy_socket = None
+            try:
+                # 4. Connect and handshake with the upstream SOCKS proxy
+                logging.debug(f"Connecting to upstream proxy {upstream_host}:{upstream_port}")
+                temp_proxy_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                temp_proxy_socket.settimeout(10)
+                temp_proxy_socket.connect((upstream_host, upstream_port))
 
-        bnd_full = proxy_socket.recv(bnd_len + 2)
-        client_socket.sendall(bnd_full)
+                temp_proxy_socket.sendall(b'\x05\x01\x00')
+                server_choice = _recv_exact(temp_proxy_socket, 2)
+                if not server_choice or len(server_choice) < 2 or server_choice[0] != 0x05 or server_choice[1] != 0x00:
+                    raise socks.SOCKS5Error(f"Upstream proxy {upstream_host}:{upstream_port} did not accept NO AUTH method. Reply: {server_choice.hex() if server_choice else 'None'}")
+                logging.debug(f"Handshake with upstream proxy {upstream_host}:{upstream_port} successful.")
+
+                # 5. Forward client's request to upstream proxy
+                temp_proxy_socket.sendall(upstream_request)
+
+                # 6. Relay reply from upstream proxy back to client
+                proxy_reply_header = _recv_exact(temp_proxy_socket, 4)
+                if not proxy_reply_header or len(proxy_reply_header) < 4:
+                    raise ConnectionAbortedError("Upstream proxy closed connection before sending reply header.")
+
+                if proxy_reply_header[1] != 0x00:
+                    raise socks.SOCKS5Error(f"Upstream proxy {upstream_host}:{upstream_port} failed request for {client_address}. REP: {proxy_reply_header[1]}.")
+
+                reply_atyp = proxy_reply_header[3]
+                if reply_atyp == 0x01: # IPv4
+                    bnd_data = _recv_exact(temp_proxy_socket, 6)
+                elif reply_atyp == 0x04: # IPv6
+                    bnd_data = _recv_exact(temp_proxy_socket, 18)
+                elif reply_atyp == 0x03: # Domain name
+                    len_byte = _recv_exact(temp_proxy_socket, 1)
+                    if not len_byte:
+                        raise ConnectionAbortedError("Failed to read bound domain length from upstream proxy.")
+                    bnd_len = len_byte[0]
+                    rest = _recv_exact(temp_proxy_socket, bnd_len + 2)
+                    if not rest:
+                        raise ConnectionAbortedError("Failed to read bound domain/port from upstream proxy.")
+                    bnd_data = len_byte + rest
+                else:
+                    raise socks.SOCKS5Error(f"Unsupported ATYP from upstream proxy: {reply_atyp}")
+
+                if not bnd_data:
+                    raise ConnectionAbortedError("Failed to read bound address/port from upstream proxy.")
+
+                client_socket.sendall(proxy_reply_header + bnd_data)
+
+                connected_proxy = upstream_proxy
+                proxy_socket = temp_proxy_socket
+                break
+
+            except (socket.error, socks.SOCKS5Error, BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as e:
+                logging.warning(f"Upstream proxy {upstream_host}:{upstream_port} failed for {client_address}: {e}. Trying next proxy in list...")
+                if temp_proxy_socket:
+                    try:
+                        temp_proxy_socket.close()
+                    except Exception:
+                        pass
+                _record_proxy_result(upstream_proxy, success=False)
+                continue
+
+        if not connected_proxy or not proxy_socket:
+            logging.error(f"All candidate upstream proxies failed for {client_address}.")
+            if not client_socket._closed:
+                try:
+                    client_socket.sendall(b'\x05\x05\x00\x01\x00\x00\x00\x00\x00\x00')
+                except socket.error:
+                    pass
+            return
 
         # 7. Relay data
-        if proxy_reply_header[1] == 0x00: # Success
-            logging.info(f"SOCKS connection established for {client_address} via {upstream_host}:{upstream_port}. Relaying data.")
-            relay_data(client_socket, proxy_socket, client_address)
-        else:
-            logging.error(f"Upstream SOCKS proxy {upstream_host}:{upstream_port} failed request for {client_address}. REP: {proxy_reply_header[1]}.")
-        
-        if upstream_proxy:
-            with _shared_state_lock:
-                if upstream_proxy not in packet_stats_per_proxy:
-                    packet_stats_per_proxy[upstream_proxy] = {"Successful": 0, "Failed": 0}
-                packet_stats_per_proxy[upstream_proxy]["Successful"] += 1
+        # Success
+        upstream_host, upstream_port = connected_proxy
+        logging.info(f"SOCKS connection established for {client_address} via {upstream_host}:{upstream_port}. Relaying data.")
+        relay_data(client_socket, proxy_socket, client_address)
+        _record_proxy_result(connected_proxy, success=True)
 
     except (socket.error, socks.SOCKS5Error, BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as e:
-        logging.error(f"Error during SOCKS relay for {client_address} via {upstream_proxy}: {e}")
-        if upstream_proxy:
-            should_demote = False
-            with _shared_state_lock:
-                if upstream_proxy not in packet_stats_per_proxy:
-                    packet_stats_per_proxy[upstream_proxy] = {"Successful": 0, "Failed": 0}
-                packet_stats_per_proxy[upstream_proxy]["Failed"] += 1
-                total = packet_stats_per_proxy[upstream_proxy]["Successful"] + packet_stats_per_proxy[upstream_proxy]["Failed"]
-                if total > packet_stats_n_packets_threshold:
-                    if packet_stats_per_proxy[upstream_proxy]["Failed"] / total > packet_stats_packet_loss_threshold:
-                        should_demote = True
-
-            if should_demote:
-                trigger_reactive_removal(upstream_proxy, "SOCKS FAILURE")
-        
-        if not client_socket._closed:
-            try:
-                client_socket.sendall(b'\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00')
-            except socket.error:
-                pass
+        logging.error(f"Error during SOCKS relay for {client_address}: {e}")
     finally:
         if client_socket and not client_socket._closed:
             client_socket.close()
