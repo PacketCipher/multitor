@@ -45,6 +45,7 @@ _demoted_proxies = set()
 packet_stats_per_proxy = {}
 packet_stats_n_packets_threshold = 100
 packet_stats_packet_loss_threshold = 0.5
+packet_stats_enable_demote = False
 
 # Max concurrent client connections to prevent thread exhaustion
 MAX_CONCURRENT_CLIENTS = 500
@@ -327,7 +328,7 @@ def _record_proxy_result(proxy_tuple, success, reason="SOCKS FAILURE"):
                 if packet_stats_per_proxy[proxy_tuple]["Failed"] / total > packet_stats_packet_loss_threshold:
                     should_demote = True
 
-    if should_demote:
+    if should_demote and packet_stats_enable_demote:
         trigger_reactive_removal(proxy_tuple, reason)
 
 def _update_proxy_lists(health_data):
