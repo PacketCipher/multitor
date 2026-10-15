@@ -45,7 +45,7 @@ _demoted_proxies = set()
 packet_stats_per_proxy = {}
 packet_stats_n_packets_threshold = 100
 packet_stats_packet_loss_threshold = 0.5
-packet_stats_enable_demote = False
+packet_stats_enable_demote = True
 
 # Max concurrent client connections to prevent thread exhaustion
 MAX_CONCURRENT_CLIENTS = 500
