@@ -46,6 +46,13 @@ packet_stats_per_proxy = {}
 packet_stats_n_packets_threshold = 100
 packet_stats_packet_loss_threshold = 0.5
 packet_stats_enable_trigger = True
+# Reload Trigger
+_reload_lock = threading.Lock()
+_reloading_proxies = set()
+RELOAD_COOLDOWN = 30 * 60  # seconds
+_last_reload_time = {}
+# Startup Config
+STARTUP_COOLDOWN = 30 * 60 # seconds
 
 # Max concurrent client connections to prevent thread exhaustion
 MAX_CONCURRENT_CLIENTS = 500
@@ -312,33 +319,66 @@ def trigger_reactive_removal(proxy_tuple, reason):
         threading.Thread(target=_async_hup, args=(controller_to_reload, proxy_tuple), daemon=True).start()
 
 def trigger_reload(proxy_tuple, reason):
-    """
-    Central function to handle a failure by reloading it.
-    """
+    """Request a Tor HUP reload, with per-proxy duplicate suppression."""
     controller_to_reload = None
+    now = time.monotonic()
 
     with _shared_state_lock:
-        if proxy_tuple in _healthy_sorted_proxies:
-            logging.warning(f"RELOAD TRIGGER ({reason}) for proxy {proxy_tuple}.")
+        if proxy_tuple not in _healthy_sorted_proxies:
+            logging.info(
+                "Reload trigger for %s ignored: proxy is not monitored.",
+                proxy_tuple,
+            )
+            return
 
-            # Reset packet statistics for this proxy so it can be re-evaluated later
+        controller_to_reload = (
+            bootstrapped_controllers.get(proxy_tuple)
+            if bootstrapped_controllers
+            else None
+        )
+
+        if controller_to_reload is None:
+            logging.warning(
+                "Cannot reload %s: no controller available. Reason: %s",
+                proxy_tuple,
+                reason,
+            )
+            return
+
+        with _reload_lock:
+            if proxy_tuple in _reloading_proxies:
+                logging.info("Reload already in progress for %s.", proxy_tuple)
+                return
+
+            last_reload = _last_reload_time.get(proxy_tuple, 0)
+            if now - last_reload < RELOAD_COOLDOWN:
+                logging.info("Reload cooldown active for %s.", proxy_tuple)
+                return
+
+            _reloading_proxies.add(proxy_tuple)
+            _last_reload_time[proxy_tuple] = now
+
             if proxy_tuple in packet_stats_per_proxy:
-                packet_stats_per_proxy[proxy_tuple] = {"Successful": 0, "Failed": 0}
+                packet_stats_per_proxy[proxy_tuple] = {
+                    "Successful": 0,
+                    "Failed": 0,
+                }
 
-            if bootstrapped_controllers and proxy_tuple in bootstrapped_controllers:
-                controller_to_reload = bootstrapped_controllers[proxy_tuple]
-        else:
-            logging.info(f"Reload trigger for {proxy_tuple} ignored as it was already reloaded.")
+    def _async_hup(ctrl, pt):
+        try:
+            ctrl.signal(Signal.HUP)
+            logging.info("HUP signal sent to Tor for %s.", pt)
+        except Exception:
+            logging.exception("Failed to send HUP signal to Tor for %s.", pt)
+        finally:
+            with _reload_lock:
+                _reloading_proxies.discard(pt)
 
-    # Execute Tor reload OUTSIDE the lock in a daemon thread so an unresponsive controller doesn't lock up all connections
-    if controller_to_reload:
-        def _async_hup(ctrl, pt):
-            try:
-                ctrl.signal(Signal.HUP)
-                logging.info(f"Tor Reloaded For {pt}")
-            except Exception as ex:
-                logging.warning(f"Failed to reload Tor for {pt}: {ex}")
-        threading.Thread(target=_async_hup, args=(controller_to_reload, proxy_tuple), daemon=True).start()
+    threading.Thread(
+        target=_async_hup,
+        args=(controller_to_reload, proxy_tuple),
+        daemon=True,
+    ).start()
 
 def _record_proxy_result(proxy_tuple, success, reason="SOCKS FAILURE"):
     """Records packet stats and reactively triggers demotion if error rate is too high."""
@@ -887,7 +927,7 @@ def wait_for_all_to_bootstrap(target_proxies, control_password):
             time.sleep(10) # Wait before re-polling remaining proxies.
         
         current_time = time.time()
-        if current_time - start_time > 30 * 60:
+        if current_time - start_time > STARTUP_COOLDOWN:
             for proxy_tuple in list(proxies_to_check):
                 # Free-Up Memory & CPU #
                 controller = bootstrapped_controllers.get(proxy_tuple)
