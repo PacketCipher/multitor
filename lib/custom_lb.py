@@ -45,7 +45,7 @@ _demoted_proxies = set()
 packet_stats_per_proxy = {}
 packet_stats_n_packets_threshold = 100
 packet_stats_packet_loss_threshold = 0.5
-packet_stats_enable_demote = True
+packet_stats_enable_trigger = True
 
 # Max concurrent client connections to prevent thread exhaustion
 MAX_CONCURRENT_CLIENTS = 500
@@ -311,11 +311,40 @@ def trigger_reactive_removal(proxy_tuple, reason):
                 logging.warning(f"Failed to reload Tor for {pt}: {ex}")
         threading.Thread(target=_async_hup, args=(controller_to_reload, proxy_tuple), daemon=True).start()
 
+def trigger_reload(proxy_tuple, reason):
+    """
+    Central function to handle a failure by reloading it.
+    """
+    controller_to_reload = None
+
+    with _shared_state_lock:
+        if proxy_tuple in _healthy_sorted_proxies:
+            logging.warning(f"RELOAD TRIGGER ({reason}) for proxy {proxy_tuple}.")
+
+            # Reset packet statistics for this proxy so it can be re-evaluated later
+            if proxy_tuple in packet_stats_per_proxy:
+                packet_stats_per_proxy[proxy_tuple] = {"Successful": 0, "Failed": 0}
+
+            if bootstrapped_controllers and proxy_tuple in bootstrapped_controllers:
+                controller_to_reload = bootstrapped_controllers[proxy_tuple]
+        else:
+            logging.info(f"Reload trigger for {proxy_tuple} ignored as it was already reloaded.")
+
+    # Execute Tor reload OUTSIDE the lock in a daemon thread so an unresponsive controller doesn't lock up all connections
+    if controller_to_reload:
+        def _async_hup(ctrl, pt):
+            try:
+                ctrl.signal(Signal.HUP)
+                logging.info(f"Tor Reloaded For {pt}")
+            except Exception as ex:
+                logging.warning(f"Failed to reload Tor for {pt}: {ex}")
+        threading.Thread(target=_async_hup, args=(controller_to_reload, proxy_tuple), daemon=True).start()
+
 def _record_proxy_result(proxy_tuple, success, reason="SOCKS FAILURE"):
     """Records packet stats and reactively triggers demotion if error rate is too high."""
     if not proxy_tuple:
         return
-    should_demote = False
+    should_trigger = False
     with _shared_state_lock:
         if proxy_tuple not in packet_stats_per_proxy:
             packet_stats_per_proxy[proxy_tuple] = {"Successful": 0, "Failed": 0}
@@ -326,10 +355,11 @@ def _record_proxy_result(proxy_tuple, success, reason="SOCKS FAILURE"):
             total = packet_stats_per_proxy[proxy_tuple]["Successful"] + packet_stats_per_proxy[proxy_tuple]["Failed"]
             if total > packet_stats_n_packets_threshold:
                 if packet_stats_per_proxy[proxy_tuple]["Failed"] / total > packet_stats_packet_loss_threshold:
-                    should_demote = True
+                    should_trigger = True
 
-    if should_demote and packet_stats_enable_demote:
-        trigger_reactive_removal(proxy_tuple, reason)
+    if should_trigger and packet_stats_enable_trigger:
+        # trigger_reactive_removal(proxy_tuple, reason)
+        trigger_reload(proxy_tuple, reason)
 
 def _update_proxy_lists(health_data):
     """
